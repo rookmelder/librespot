@@ -8,7 +8,6 @@ description = "An open source client library for Spotify, with support for Spoti
 keywords = ["audio", "spotify", "music", "streaming", "connect"]
 categories = ["multimedia::audio"]
 repository.workspace = true
-readme = "README.md"
 edition.workspace = true
 include = [
     "src/**/*",
@@ -22,10 +21,8 @@ include = [
     "playback/**/*",
     "protocol/**/*",
     "Cargo.toml",
-    "README.md",
     "LICENSE",
     "COMPILING.md",
-    "CONTRIBUTING.md",
 ]
 
 [workspace.package]
@@ -70,7 +67,7 @@ rustls-tls-webpki-roots = [
     "librespot-oauth/rustls-tls-webpki-roots",
 ]
 
-# Audio backends - see README.md for audio backend selection guide
+# Audio backends
 # Cross-platform backends:
 
 # rodio-backend: Cross-platform audio backend using Rodio (default). Provides good cross-platform
@@ -181,34 +178,6 @@ tokio = { version = "1", features = [
     "process",
 ] }
 url = "2.2"
-
-[package.metadata.deb]
-maintainer = "Librespot Organization <noreply@github.com>"
-copyright = "2015, Paul Liétar"
-license-file = ["LICENSE", "4"]
-depends = "$auto"
-recommends = "avahi-daemon"
-extended-description = """\
-librespot is an open source client library for Spotify. It enables applications \
-to use Spotify's service to control and play music via various backends, and to \
-act as a Spotify Connect receiver. It is an alternative to the official and now \
-deprecated closed-source libspotify. Additionally, it provides extra features \
-which are not available in the official library.
-.
-This package provides the librespot binary for headless Spotify Connect playback. \
-.
-Note: librespot only works with Spotify Premium accounts."""
-section = "sound"
-priority = "optional"
-assets = [
-    # Main binary
-    ["target/release/librespot", "usr/bin/", "755"],
-    # Documentation
-    ["README.md", "usr/share/doc/librespot/", "644"],
-    # Systemd services
-    ["contrib/librespot.service", "lib/systemd/system/", "644"],
-    ["contrib/librespot.user.service", "lib/systemd/user/", "644"],
-]
 
 [workspace.lints]
 clippy.implicit_clone = "warn"

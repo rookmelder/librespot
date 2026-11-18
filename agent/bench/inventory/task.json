@@ -1,0 +1,1 @@
+{"part": "inventory", "files": ["inventory.py", "tests/test_inventory.py"], "include": ["inventory.py"], "tests": 10}

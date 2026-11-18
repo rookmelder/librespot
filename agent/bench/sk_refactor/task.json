@@ -1,0 +1,5 @@
+{"role": "builderplus", "kind": "build", "level": "real", "project": "shopkeeper",
+ "skills": ["refactor", "behaviour-preserving", "dataclasses", "extensibility", "characterization"],
+ "part": "discounts", "files": ["shop/discounts.py", "tests/test_discounts.py"],
+ "include": ["shop/discounts.py", "tests/test_discounts.py", "shop/money.py", "shop/models.py", "knowledge/systems/discounts.md"],
+ "tests": 14}

@@ -1,0 +1,13 @@
+{
+  "bugs": [
+    {"id": "split_leftover_to_biggest_weight", "file": "shop/money.py",
+     "find": "biggest_first = sorted(range(len(weights)), key=lambda i: (-weights[i], i))", "tol": 3}
+  ],
+  "decoys": [
+    {"id": "fixed_split_over_net", "file": "shop/discounts.py",
+     "find": "for line, part in zip(lines, money.split(amount, [line.net for line in lines])):"},
+    {"id": "vat_per_rate_summed", "file": "shop/invoices.py",
+     "find": "by_rate[rate] = by_rate.get(rate, 0) + net"}
+  ],
+  "keywords": ["remainder", "largest weight", "biggest weight", "biggest part", "largest part", "weights[i]", "by weight"]
+}

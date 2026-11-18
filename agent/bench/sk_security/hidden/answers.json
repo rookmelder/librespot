@@ -1,0 +1,10 @@
+{
+  "bugs": [
+    {"id": "absolute_export_name", "file": "shop/exports.py", "find": "if name.startswith('..'):", "tol": 3},
+    {"id": "product_name_not_guarded", "file": "shop/exports.py", "find": "rows.append([o.id, o.created, _safe(o.customer), product.name", "tol": 2},
+    {"id": "admin_substring_match", "file": "shop/exports.py", "find": "if not user or user not in admins:", "tol": 2},
+    {"id": "token_in_error_message", "file": "shop/notify.py", "find": "(sent {request.headers})", "tol": 2},
+    {"id": "missing_signature_accepted", "file": "shop/notify.py", "find": "return True          # warehouses before", "tol": 2}
+  ],
+  "decoys": []
+}

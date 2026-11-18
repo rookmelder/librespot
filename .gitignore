@@ -8,3 +8,12 @@ spotify_appkey.key
 .cache
 *.save
 *.*~
+
+# Multi-Agent template
+.env
+.worker/
+SETUP.md
+__pycache__/
+.obsidian
+# rusty-player credentials
+cache/

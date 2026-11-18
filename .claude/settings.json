@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python agent/delegate.py:*)",
+      "Bash(python agent/check_setup.py:*)",
+      "Bash(python agent/bench.py:*)",
+      "Bash(python -m unittest discover -s agent/tests:*)",
+      "PowerShell(python agent/delegate.py:*)",
+      "PowerShell(python agent/check_setup.py:*)",
+      "PowerShell(python agent/bench.py:*)",
+      "PowerShell(python -m unittest discover -s agent/tests:*)"
+    ]
+  }
+}

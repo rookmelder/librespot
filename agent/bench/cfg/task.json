@@ -1,0 +1,3 @@
+{"role": "builderplus", "level": "hard", "skills": ["multi-file", "atomicity", "cache-invalidation", "parsing"], "part": "cfg",
+ "files": ["cfg/parser.py", "cfg/store.py", "cfg/service.py", "tests/test_cfg.py"],
+ "include": ["cfg/parser.py", "cfg/store.py", "cfg/service.py"], "tests": 11}

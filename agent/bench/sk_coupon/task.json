@@ -1,0 +1,4 @@
+{"role": "builder", "kind": "build", "level": "real", "project": "shopkeeper",
+ "skills": ["existing-code", "conventions", "error-order", "dates"],
+ "part": "discounts", "files": ["shop/discounts.py", "tests/test_discounts.py"],
+ "include": ["shop/discounts.py", "tests/test_discounts.py", "knowledge/systems/discounts.md"], "tests": 10}

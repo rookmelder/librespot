@@ -1,0 +1,4 @@
+{"role": "debugger", "kind": "debug", "level": "real", "project": "shopkeeper",
+ "skills": ["root-cause", "cross-module", "decoys", "rounding"],
+ "part": "invoices", "files": [],
+ "include": ["shop/invoices.py", "tests/test_invoices.py", "knowledge/systems/invoices.md"], "tests": 2}

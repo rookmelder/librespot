@@ -1,0 +1,4 @@
+{"role": "tester", "kind": "tester", "level": "real", "project": "shopkeeper",
+ "skills": ["edge-cases", "boundaries", "rounding", "aliasing", "mutation-killing"],
+ "part": "discounts", "module": "shop/discounts.py", "files": ["tests/test_discounts.py"],
+ "include": ["shop/discounts.py", "tests/test_discounts.py", "shop/models.py", "knowledge/systems/discounts.md"], "tests": 20}

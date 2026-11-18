@@ -9,7 +9,16 @@ spotify_appkey.key
 *.save
 *.*~
 
-# Multi-Agent template
+# AI / Multi-Agent files (the app doesn't use these)
+/CLAUDE.md
+/MULTI-AGENT.md
+/GOAL.md
+/PROJECT.md
+/agent/
+/templates/
+/knowledge/
+/.agents/
+/.claude/
 .env
 .worker/
 SETUP.md

@@ -1,5 +1,0 @@
-{"role": "builderplus", "kind": "build", "level": "real", "project": "shopkeeper",
- "skills": ["multi-file", "money-rounding", "state", "stock", "file-format-migration", "atomicity"],
- "part": "orders", "files": ["shop/models.py", "shop/orders.py", "shop/storage.py", "tests/test_orders.py", "tests/test_storage.py"],
- "include": ["shop/models.py", "shop/orders.py", "shop/storage.py", "tests/test_orders.py", "tests/test_storage.py",
-             "knowledge/systems/orders.md", "knowledge/systems/storage.md", "knowledge/systems/money.md"], "tests": 12}

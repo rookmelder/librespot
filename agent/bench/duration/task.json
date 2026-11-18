@@ -1,2 +1,0 @@
-{"role": "tester", "level": "medium", "skills": ["edge-cases", "error-messages", "mutation-killing"], "part": "duration",
- "module": "duration.py", "files": ["tests/test_duration.py"], "include": ["duration.py"], "tests": 12}

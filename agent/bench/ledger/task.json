@@ -1,2 +1,0 @@
-{"role": "builder", "level": "medium", "skills": ["error-order", "atomicity", "state"], "part": "ledger",
- "files": ["ledger.py", "tests/test_ledger.py"], "include": ["ledger.py"], "tests": 11}

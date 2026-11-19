@@ -13,7 +13,36 @@ use librespot::playback::{
     mixer::{self, Mixer, MixerConfig},
     player::{Player, PlayerEvent},
 };
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, error::SendError};
+
+/// The engine's end of the event channel. After every event it calls `notify`, so a window can redraw at
+/// once instead of polling (egui: `ctx.request_repaint()`). The terminal passes a `notify` that does nothing.
+pub struct EventSender {
+    tx: UnboundedSender<Event>,
+    notify: Box<dyn Fn() + Send + Sync>,
+}
+
+impl EventSender {
+    pub fn new(tx: UnboundedSender<Event>, notify: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            tx,
+            notify: Box::new(notify),
+        }
+    }
+
+    /// Fails only when the controller dropped its receiver: then the engine should stop.
+    pub fn send(&self, event: Event) -> Result<(), SendError<Event>> {
+        self.tx.send(event)?;
+        (self.notify)();
+        Ok(())
+    }
+}
+
+/// What to do after handling one command.
+enum Flow {
+    Continue,
+    Quit,
+}
 
 /// What the controller asks the engine to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -53,16 +82,31 @@ pub struct EngineConfig {
 pub async fn run_engine(
     config: EngineConfig,
     cmd_rx: UnboundedReceiver<Command>,
-    evt_tx: UnboundedSender<Event>,
+    evt_tx: EventSender,
 ) {
     let mut cmd_rx = cmd_rx;
-    let session = match crate::login::connect().await {
-        Ok(session) => session,
-        Err(error) => {
-            if evt_tx.send(Event::Error(format!("{error:#}"))).is_err() {
-                log::debug!("engine event receiver dropped");
-            }
-            return;
+
+    // Log in, but keep listening for commands: Quit (or a closed channel, e.g. the window was closed) must
+    // end the engine right away, even while the login is still waiting on the network. Other commands that
+    // arrive during login are kept and run once the player exists.
+    let mut pending = Vec::new();
+    let login = crate::login::connect();
+    tokio::pin!(login);
+    let session = loop {
+        tokio::select! {
+            result = &mut login => match result {
+                Ok(session) => break session,
+                Err(error) => {
+                    if evt_tx.send(Event::Error(format!("{error:#}"))).is_err() {
+                        log::debug!("engine event receiver dropped");
+                    }
+                    return;
+                }
+            },
+            command = cmd_rx.recv() => match command {
+                Some(Command::Quit) | None => return,
+                Some(command) => pending.push(command),
+            },
         }
     };
     if evt_tx
@@ -124,47 +168,46 @@ pub async fn run_engine(
     );
     let mut player_events = player.get_player_event_channel();
 
-    loop {
-        tokio::select! {
-            command = cmd_rx.recv() => {
-                match command {
-                    Some(Command::Play(text)) => match crate::track::parse_track(&text) {
-                        Ok(id) => player.load(SpotifyUri::Track { id }, true, 0),
-                        Err(error) => {
-                            if evt_tx.send(Event::Error(format!("{error:#}"))).is_err() {
+    // Commands that arrived during login, in the order they were sent.
+    let mut quit = false;
+    for command in pending {
+        if let Flow::Quit = handle_command(command, &player, mixer.as_ref(), &evt_tx) {
+            quit = true;
+            break;
+        }
+    }
+
+    if !quit {
+        loop {
+            tokio::select! {
+                command = cmd_rx.recv() => {
+                    match command {
+                        Some(command) => {
+                            if let Flow::Quit = handle_command(command, &player, mixer.as_ref(), &evt_tx) {
                                 break;
                             }
                         }
-                    },
-                    Some(Command::Pause) => player.pause(),
-                    Some(Command::Resume) => player.play(),
-                    Some(Command::Stop) => player.stop(),
-                    Some(Command::SetVolume(volume)) => {
-                        mixer.set_volume(volume);
-                        if evt_tx.send(Event::VolumeChanged(volume)).is_err() {
+                        None => break,
+                    }
+                }
+                event = player_events.recv() => {
+                    match event {
+                        Some(event) => {
+                            if let Some(event) = map_player_event(&event) {
+                                if evt_tx.send(event).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        None => {
+                            if evt_tx
+                                .send(Event::Error("player stopped unexpectedly".into()))
+                                .is_err()
+                            {
+                                log::debug!("engine event receiver dropped");
+                            }
                             break;
                         }
-                    }
-                    Some(Command::Quit) | None => break,
-                }
-            }
-            event = player_events.recv() => {
-                match event {
-                    Some(event) => {
-                        if let Some(event) = map_player_event(&event) {
-                            if evt_tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    None => {
-                        if evt_tx
-                            .send(Event::Error("player stopped unexpectedly".into()))
-                            .is_err()
-                        {
-                            log::debug!("engine event receiver dropped");
-                        }
-                        break;
                     }
                 }
             }
@@ -173,6 +216,45 @@ pub async fn run_engine(
 
     player.stop();
     session.shutdown();
+}
+
+/// Run one command on the player. `Flow::Quit` on `Command::Quit` or when the controller is gone.
+fn handle_command(
+    command: Command,
+    player: &Player,
+    mixer: &dyn Mixer,
+    evt_tx: &EventSender,
+) -> Flow {
+    let sent = match command {
+        Command::Play(text) => match crate::track::parse_track(&text) {
+            Ok(id) => {
+                player.load(SpotifyUri::Track { id }, true, 0);
+                Ok(())
+            }
+            Err(error) => evt_tx.send(Event::Error(format!("{error:#}"))),
+        },
+        Command::Pause => {
+            player.pause();
+            Ok(())
+        }
+        Command::Resume => {
+            player.play();
+            Ok(())
+        }
+        Command::Stop => {
+            player.stop();
+            Ok(())
+        }
+        Command::SetVolume(volume) => {
+            mixer.set_volume(volume);
+            evt_tx.send(Event::VolumeChanged(volume))
+        }
+        Command::Quit => return Flow::Quit,
+    };
+    match sent {
+        Ok(()) => Flow::Continue,
+        Err(_) => Flow::Quit,
+    }
 }
 
 fn map_player_event(ev: &PlayerEvent) -> Option<Event> {

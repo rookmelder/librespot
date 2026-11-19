@@ -2,6 +2,20 @@
 
 What happened on rusty-player, newest first. Short entries: what was done, what went wrong, what was learned.
 
+## 2026-11-19: Phase 3, the first window
+
+- `rusty-player` now opens an egui window (eframe 0.32.3, the newest that fits Rust 1.85); `--cli` keeps the
+  terminal mode. Window: track field + Play (or Enter), Pause / Resume / Stop, volume slider, status and errors.
+- The window runs on the main thread, the engine on its own thread with its own Tokio runtime. The engine wakes
+  the window after every event (`EventSender` calls `ctx.request_repaint()`), so it never polls.
+- Fixed from Phase 2: closing (or `q`) during login no longer waits for the login; commands sent during login
+  are kept and run after it, in order.
+- Who built what: the Lead wrote the threading (`ui::run`), the engine changes and `cli.rs`; builder (Gemini 3.8
+  Flash Low) wrote the window layout (1 fix round). rust-reviewer (GPT-6 Astra): no real problems.
+- Tested: window opens, logs in, shows the controls (screenshot); closing it exits in 0.1 s with code 0; terminal
+  mode still works and runs commands typed during login. Play in the window not clicked yet, no sound heard yet.
+- Lesson: clippy rejects `while !flag { ... }` when the loop never changes `flag` (`while_immutable_condition`).
+
 ## 2026-11-19: Phase 2, the engine with commands and events
 
 - Split the app into parts: `login.rs` (cached login), `track.rs` (reading a track ID or link), `engine.rs`

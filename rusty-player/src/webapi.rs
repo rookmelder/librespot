@@ -34,16 +34,19 @@ const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 const SEARCH_PAGES: usize = 2;
 
 /// One playlist in the user's list.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlaylistSummary {
     pub id: String,
     pub name: String,
     pub track_count: u32,
     pub image_url: Option<String>,
+    /// Changes whenever the playlist changes: used to know if cached tracks are still current.
+    #[serde(default)]
+    pub snapshot_id: Option<String>,
 }
 
 /// One playable track in a playlist.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrackSummary {
     /// `spotify:track:<id>`: what `Command::Play` takes.
     pub uri: String,
@@ -56,7 +59,7 @@ pub struct TrackSummary {
 }
 
 /// One page of the user's playable Liked Songs.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LikedPage {
     pub offset: u32,
     pub tracks: Vec<TrackSummary>,
@@ -64,7 +67,7 @@ pub struct LikedPage {
 }
 
 /// The user's recent listening and short-term favorites.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Stats {
     pub recently_played: Vec<TrackSummary>,
     pub top_tracks: Vec<TrackSummary>,
@@ -147,41 +150,11 @@ impl WebApi {
 
     /// All of the user's playlists (follows the paging until the end).
     pub async fn playlists(&mut self) -> Result<Vec<PlaylistSummary>> {
-        #[derive(Deserialize)]
-        struct Page {
-            items: Vec<Item>,
-            next: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct Item {
-            id: String,
-            name: String,
-            // Newer answers call the count `items`, older ones `tracks`.
-            items: Option<Tracks>,
-            tracks: Option<Tracks>,
-            #[serde(default)]
-            images: Option<Vec<ApiImage>>,
-        }
-        #[derive(Deserialize)]
-        struct Tracks {
-            total: u32,
-        }
-
         let mut playlists = Vec::new();
         let mut url = Some(format!("{API}/me/playlists?limit=50"));
         while let Some(next) = url {
-            let page: Page = self.get(&next).await.context("could not load playlists")?;
-            playlists.extend(page.items.into_iter().map(|item| {
-                PlaylistSummary {
-                    id: item.id,
-                    name: item.name,
-                    track_count: item.items.or(item.tracks).map_or(0, |t| t.total),
-                    image_url: item
-                        .images
-                        .and_then(|imgs| imgs.into_iter().next())
-                        .map(|img| img.url),
-                }
-            }));
+            let page: PlaylistPage = self.get(&next).await.context("could not load playlists")?;
+            playlists.extend(page.items.into_iter().map(PlaylistItem::into_summary));
             url = next_page(page.next)?;
         }
         Ok(playlists)
@@ -343,6 +316,45 @@ impl WebApi {
                 .context("unexpected Web API answer");
         }
         bail!("Spotify rate limit: try again later")
+    }
+}
+
+#[derive(Deserialize)]
+struct PlaylistPage {
+    items: Vec<PlaylistItem>,
+    next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PlaylistItem {
+    id: String,
+    name: String,
+    // Newer answers call the count `items`, older ones `tracks`.
+    items: Option<PlaylistCount>,
+    tracks: Option<PlaylistCount>,
+    #[serde(default)]
+    images: Option<Vec<ApiImage>>,
+    #[serde(default)]
+    snapshot_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PlaylistCount {
+    total: u32,
+}
+
+impl PlaylistItem {
+    fn into_summary(self) -> PlaylistSummary {
+        PlaylistSummary {
+            id: self.id,
+            name: self.name,
+            track_count: self.items.or(self.tracks).map_or(0, |t| t.total),
+            image_url: self
+                .images
+                .and_then(|imgs| imgs.into_iter().next())
+                .map(|img| img.url),
+            snapshot_id: self.snapshot_id,
+        }
     }
 }
 
@@ -554,6 +566,26 @@ fn save_token(token: &SavedToken) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_page_reads_optional_snapshots() -> Result<()> {
+        let page: PlaylistPage = serde_json::from_str(
+            r#"{"next":null,"items":[
+                {"id":"example1","name":"First","items":{"total":2},"snapshot_id":"revision1"},
+                {"id":"example2","name":"Second","tracks":{"total":3}}
+            ]}"#,
+        )?;
+        let summaries: Vec<_> = page
+            .items
+            .into_iter()
+            .map(PlaylistItem::into_summary)
+            .collect();
+        assert_eq!(summaries[0].snapshot_id.as_deref(), Some("revision1"));
+        assert_eq!(summaries[1].snapshot_id, None);
+        assert_eq!(summaries[0].track_count, 2);
+        assert_eq!(summaries[1].track_count, 3);
+        Ok(())
+    }
 
     #[test]
     fn playlist_entries_keep_only_spotify_tracks() {

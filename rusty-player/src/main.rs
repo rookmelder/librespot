@@ -5,12 +5,14 @@
 
 mod cli;
 mod engine;
+mod imagecache;
 mod login;
 mod queue;
 mod settings;
 mod track;
 mod ui;
 mod webapi;
+mod webcache;
 
 use std::path::PathBuf;
 

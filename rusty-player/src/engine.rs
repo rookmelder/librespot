@@ -8,6 +8,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use crate::settings::{self, Settings};
 use crate::webapi::{LikedPage, PlaylistSummary, Stats, TrackSummary, WebApi};
+use crate::webcache::{WebCache, now_unix};
 use librespot::core::SpotifyUri;
 use librespot::metadata::audio::{AudioItem, UniqueFields};
 use librespot::playback::{
@@ -243,11 +244,19 @@ pub async fn run_engine(
     let mut player_events = player.get_player_event_channel();
 
     let web_api: SharedWebApi = Arc::new(tokio::sync::Mutex::new(None));
+    let web_cache = WebCache::new();
 
     // Commands that arrived during login, in the order they were sent.
     let mut quit = false;
     for command in pending {
-        if let Flow::Quit = handle_command(command, &player, mixer.as_ref(), &evt_tx, &web_api) {
+        if let Flow::Quit = handle_command(
+            command,
+            &player,
+            mixer.as_ref(),
+            &evt_tx,
+            &web_api,
+            &web_cache,
+        ) {
             quit = true;
             break;
         }
@@ -259,7 +268,7 @@ pub async fn run_engine(
                 command = cmd_rx.recv() => {
                     match command {
                         Some(command) => {
-                            if let Flow::Quit = handle_command(command, &player, mixer.as_ref(), &evt_tx, &web_api) {
+                            if let Flow::Quit = handle_command(command, &player, mixer.as_ref(), &evt_tx, &web_api, &web_cache) {
                                 break;
                             }
                         }
@@ -301,6 +310,7 @@ fn handle_command(
     mixer: &dyn Mixer,
     evt_tx: &EventSender,
     web_api: &SharedWebApi,
+    web_cache: &WebCache,
 ) -> Flow {
     let sent = match command {
         Command::Play(text) => match crate::track::parse_track(&text) {
@@ -328,44 +338,140 @@ fn handle_command(
         }
         // Web API calls run as their own task, so the player keeps reacting to commands meanwhile.
         Command::LoadPlaylists => {
-            spawn_web_call(web_api, evt_tx, |api| {
-                Box::pin(async move { api.playlists().await.map(Event::PlaylistsLoaded) })
+            let cached = web_cache
+                .load::<Vec<PlaylistSummary>>("playlists")
+                .map(|(_, list)| list);
+            if let Some(list) = &cached {
+                if evt_tx.send(Event::PlaylistsLoaded(list.clone())).is_err() {
+                    return Flow::Quit;
+                }
+            }
+            let cache = web_cache.clone();
+            spawn_web_call(web_api, evt_tx, cached.is_some(), move |api| {
+                Box::pin(async move {
+                    let list = api.playlists().await?;
+                    cache.set_snapshots(&list);
+                    if cached.as_ref() == Some(&list) {
+                        return Ok(None);
+                    }
+                    cache.save("playlists", &list);
+                    Ok(Some(Event::PlaylistsLoaded(list)))
+                })
             });
             Ok(())
         }
         Command::LoadPlaylistTracks(playlist_id) => {
-            spawn_web_call(web_api, evt_tx, move |api| {
+            let key = format!("playlist_{playlist_id}");
+            let cached = web_cache
+                .load::<CachedPlaylistTracks>(&key)
+                .map(|(_, value)| value);
+            if let Some(value) = &cached {
+                if evt_tx
+                    .send(Event::PlaylistTracksLoaded {
+                        playlist_id: playlist_id.clone(),
+                        tracks: value.tracks.clone(),
+                    })
+                    .is_err()
+                {
+                    return Flow::Quit;
+                }
+                if value.snapshot_id.is_some()
+                    && value.snapshot_id == web_cache.snapshot(&playlist_id)
+                {
+                    return Flow::Continue;
+                }
+            }
+            let cache = web_cache.clone();
+            spawn_web_call(web_api, evt_tx, cached.is_some(), move |api| {
                 Box::pin(async move {
                     let tracks = api.playlist_tracks(&playlist_id).await?;
-                    Ok(Event::PlaylistTracksLoaded {
+                    cache.save(
+                        &key,
+                        &CachedPlaylistTracks {
+                            snapshot_id: cache.snapshot(&playlist_id),
+                            tracks: tracks.clone(),
+                        },
+                    );
+                    if cached.as_ref().is_some_and(|value| value.tracks == tracks) {
+                        return Ok(None);
+                    }
+                    Ok(Some(Event::PlaylistTracksLoaded {
                         playlist_id,
                         tracks,
-                    })
+                    }))
                 })
             });
             Ok(())
         }
         Command::LoadLikedPage { offset } => {
-            spawn_web_call(web_api, evt_tx, move |api| {
+            let key = format!("liked_{offset}");
+            if offset > 0 && web_cache.liked_checked() {
+                if let Some((_, page)) = web_cache.load::<LikedPage>(&key) {
+                    return match evt_tx.send(Event::LikedPageLoaded(page)) {
+                        Ok(()) => Flow::Continue,
+                        Err(_) => Flow::Quit,
+                    };
+                }
+            }
+            let cache = web_cache.clone();
+            spawn_web_call(web_api, evt_tx, false, move |api| {
                 Box::pin(async move {
-                    api.liked_tracks_page(offset)
-                        .await
-                        .map(Event::LikedPageLoaded)
+                    let page = api.liked_tracks_page(offset).await?;
+                    if offset == 0 {
+                        let unchanged =
+                            cache.load::<LikedPage>("liked_0").is_some_and(|(_, old)| {
+                                old.total == page.total
+                                    && old
+                                        .tracks
+                                        .iter()
+                                        .map(|track| &track.uri)
+                                        .eq(page.tracks.iter().map(|track| &track.uri))
+                            });
+                        if !unchanged {
+                            cache.remove_prefix("liked_");
+                            cache.save("liked_0", &page);
+                        }
+                        cache.set_liked_checked();
+                    } else if cache.liked_checked() {
+                        cache.save(&key, &page);
+                    }
+                    Ok(Some(Event::LikedPageLoaded(page)))
                 })
             });
             Ok(())
         }
         Command::LoadStats => {
-            spawn_web_call(web_api, evt_tx, |api| {
-                Box::pin(async move { api.stats().await.map(Event::StatsLoaded) })
+            if let Some((saved, stats)) = web_cache.load::<Stats>("stats") {
+                if now_unix().saturating_sub(saved) < 6 * 3600 {
+                    return match evt_tx.send(Event::StatsLoaded(stats)) {
+                        Ok(()) => Flow::Continue,
+                        Err(_) => Flow::Quit,
+                    };
+                }
+            }
+            let cache = web_cache.clone();
+            spawn_web_call(web_api, evt_tx, false, move |api| {
+                Box::pin(async move {
+                    let stats = api.stats().await?;
+                    cache.save("stats", &stats);
+                    Ok(Some(Event::StatsLoaded(stats)))
+                })
             });
             Ok(())
         }
         Command::Search(query) => {
-            spawn_web_call(web_api, evt_tx, move |api| {
+            if let Some(tracks) = web_cache.search_get(&query) {
+                return match evt_tx.send(Event::SearchResults { query, tracks }) {
+                    Ok(()) => Flow::Continue,
+                    Err(_) => Flow::Quit,
+                };
+            }
+            let cache = web_cache.clone();
+            spawn_web_call(web_api, evt_tx, false, move |api| {
                 Box::pin(async move {
                     let tracks = api.search_tracks(&query).await?;
-                    Ok(Event::SearchResults { query, tracks })
+                    cache.search_put(&query, tracks.clone());
+                    Ok(Some(Event::SearchResults { query, tracks }))
                 })
             });
             Ok(())
@@ -386,11 +492,17 @@ fn handle_command(
 /// (login, requests); one request at a time is fine for a single user.
 type SharedWebApi = Arc<tokio::sync::Mutex<Option<WebApi>>>;
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedPlaylistTracks {
+    snapshot_id: Option<String>,
+    tracks: Vec<TrackSummary>,
+}
+
 type WebCall = Box<
     dyn for<'a> FnOnce(
             &'a mut WebApi,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = anyhow::Result<Event>> + Send + 'a>,
+            Box<dyn std::future::Future<Output = anyhow::Result<Option<Event>>> + Send + 'a>,
         > + Send,
 >;
 
@@ -398,10 +510,11 @@ type WebCall = Box<
 fn spawn_web_call(
     web_api: &SharedWebApi,
     evt_tx: &EventSender,
+    cached_sent: bool,
     call: impl for<'a> FnOnce(
         &'a mut WebApi,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = anyhow::Result<Event>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = anyhow::Result<Option<Event>>> + Send + 'a>,
     > + Send
     + 'static,
 ) {
@@ -411,13 +524,19 @@ fn spawn_web_call(
     tokio::spawn(async move {
         let event = match with_web_api(&web_api, call).await {
             Ok(event) => event,
-            Err(error) => Event::Error(format!("{error:#}")),
+            Err(error) if cached_sent => {
+                log::warn!("could not refresh cached Web API data: {error:#}");
+                None
+            }
+            Err(error) => Some(Event::Error(format!("{error:#}"))),
         };
-        let _ = evt_tx.send(event);
+        if let Some(event) = event {
+            let _ = evt_tx.send(event);
+        }
     });
 }
 
-async fn with_web_api(web_api: &SharedWebApi, call: WebCall) -> anyhow::Result<Event> {
+async fn with_web_api(web_api: &SharedWebApi, call: WebCall) -> anyhow::Result<Option<Event>> {
     let mut guard = web_api.lock().await;
     if guard.is_none() {
         *guard = Some(WebApi::login().await?);

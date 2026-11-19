@@ -4929,6 +4929,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "egui_extras",
+ "ehttp",
  "env_logger",
  "image",
  "librespot",

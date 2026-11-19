@@ -145,6 +145,7 @@ pub fn run(to_file: Option<PathBuf>, settings: crate::settings::Settings) -> Res
         Box::new(move |cc| {
             let _ = ctx_slot.set(cc.egui_ctx.clone());
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            crate::imagecache::install(&cc.egui_ctx);
             load_fonts(&cc.egui_ctx);
             apply_theme(&cc.egui_ctx);
             let app = PlayerApp::new(cmd_tx, evt_rx, ui_settings);
@@ -2610,6 +2611,7 @@ mod tests {
             name: "Chill".into(),
             track_count: 12,
             image_url: None,
+            snapshot_id: None,
         };
         assert_eq!(playlist_label(&p), "Chill (12)");
     }
@@ -2626,12 +2628,14 @@ mod tests {
                 name: "Rock".into(),
                 track_count: 50,
                 image_url: None,
+                snapshot_id: None,
             },
             PlaylistSummary {
                 id: "2".into(),
                 name: "Jazz".into(),
                 track_count: 20,
                 image_url: None,
+                snapshot_id: None,
             },
         ];
 

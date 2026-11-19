@@ -16,6 +16,7 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 eframe = "0.32.3"
+ehttp = { version = "0.5", default-features = false }
 egui_extras = { version = "0.32", features = ["http", "image"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }

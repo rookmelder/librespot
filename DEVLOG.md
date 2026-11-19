@@ -2,6 +2,15 @@
 
 What happened on rusty-player, newest first. Short entries: what was done, what went wrong, what was learned.
 
+## 2026-11-19: Cache for Web API answers and images
+
+- Not rate limited: no 429 warnings seen; `webapi.rs` already waits once on a short 429.
+- `rusty-player/src/webcache.rs`: `WebCache` saves Web API answers as JSON in `%APPDATA%\rusty-player\cache\web\<key>.json` (`{saved_unix, value}`), written to `.tmp` then renamed so a crash never leaves a half file. Keys only `[A-Za-z0-9_-]`.
+- How "is it up to date" works (engine.rs): playlists: cached list shown at once, then one API call refreshes it; each playlist has a `snapshot_id` that changes when the playlist changes, so cached tracks are reused without an API call when the snapshot matches. Liked Songs: page 0 is always fetched; if total and first 50 songs match the cache, later pages come from disk. Known limit: a change deeper in Liked Songs with the same total and same first 50 is not noticed until page 0 changes. Stats: cached 6 hours. Search: kept in memory 10 minutes. If a refresh fails while cached data is shown, only a warning is logged.
+- `rusty-player/src/imagecache.rs`: an egui `BytesLoader` (`DiskImageLoader`) added after egui_extras' loaders, so egui asks it first. Images saved in `%APPDATA%\rusty-player\cache\images\` named by a 64-bit FNV-1a hash of the URL; downloaded with `ehttp`; folder trimmed to 150 MB when over 200 MB at startup (oldest first).
+- Rust notes: trait objects (`Arc<dyn BytesLoader>`), why `std::sync::Mutex` must not be held across `.await`, `Option<Event>` so a refresh can send nothing when nothing changed, why not `DefaultHasher` (not guaranteed stable between Rust versions).
+- Tests: 102 pass, clippy clean. Reviewer (rust-reviewer) found no bugs; noted that cached images are read on the UI thread (small local files, kept).
+
 ## 2026-11-19: Shuffle like YouTube Music (Up Next queue)
 
 - New `rusty-player/src/queue.rs` holds a `Queue` (list of `QueueEntry`, each with a unique `id` and a `TrackSummary`), `pos` = index of the song now playing, and `source` (`QueueSource`: Playlist(name), Liked, Search, Stats, Link).

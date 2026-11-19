@@ -25,6 +25,9 @@ include = [
     "COMPILING.md",
 ]
 
+[workspace]
+members = ["rusty-player"]
+
 [workspace.package]
 rust-version = "1.85"
 authors = ["Librespot Org"]

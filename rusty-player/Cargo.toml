@@ -1,0 +1,20 @@
+[package]
+name = "rusty-player"
+version = "0.1.0"
+description = "A lightweight Spotify desktop player for Windows, built on librespot"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+publish = false
+
+[dependencies]
+# The librespot crates in this repo. Only the features a Windows desktop player needs:
+# native-tls (Windows SChannel, no OpenSSL) and rodio-backend (audio output via WASAPI).
+librespot = { path = "..", default-features = false, features = ["native-tls", "rodio-backend"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[lints]
+workspace = true

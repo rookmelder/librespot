@@ -2,6 +2,19 @@
 
 What happened on rusty-player, newest first. Short entries: what was done, what went wrong, what was learned.
 
+## 2026-11-19: Phase 1, log in and play one track (CLI)
+
+- `rusty-player` with no arguments only logs in with the cached credentials and prints the account. It never plays.
+- `rusty-player play <track>` plays one track on the speakers and exits when it ends (or on Ctrl+C).
+  `<track>` can be an ID, a `spotify:track:` URI, or a share link (`open.spotify.com/track/...?si=...`).
+- `rusty-player play <track> --to-file <file>` decodes the track into a raw audio file instead: silent.
+  Used to test without sound: a 3:33 track gave 37,671,984 bytes (44.1 kHz, stereo, 16-bit = exactly 3:33) in 10 s.
+- Not yet heard on the speakers (sound was off on purpose).
+- Review (rust-reviewer, GPT-6 Astra): 4 small findings, all fixed: `std::env::args()` panics on non-Unicode
+  arguments (now `args_os()`), a Ctrl+C listener error was ignored, the session was not shut down when playing
+  failed, and a share link with `/track/` only in its `?si=` part was accepted.
+- Lesson: `OsString::display()` needs Rust 1.87; the workspace promises 1.85, so clippy refused it.
+
 ## 2026-11-19: Phase 0, project set up
 
 - Created `rusty-player/`, a new crate in this workspace. It uses the librespot code in this repo directly

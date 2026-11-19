@@ -57,6 +57,7 @@ fn apply_theme(ctx: &egui::Context) {
     style.visuals = egui::Visuals::dark();
     style.visuals.panel_fill = BACKGROUND;
     style.visuals.window_fill = BACKGROUND;
+    style.interaction.selectable_labels = false;
     style.visuals.override_text_color = Some(egui::Color32::WHITE);
     style.visuals.weak_text_color = Some(egui::Color32::from_rgb(179, 179, 179));
     style.visuals.selection.bg_fill = GREEN;
@@ -1134,7 +1135,7 @@ impl PlayerApp {
                                         egui::vec2(available_w, row_height),
                                         egui::Sense::hover(),
                                     );
-                                    let is_hovered = row_resp.hovered();
+                                    let is_hovered = row_resp.contains_pointer();
                                     let bg_color = if is_current {
                                         CARD
                                     } else if is_hovered {
@@ -1377,7 +1378,7 @@ fn library_entry(
 ) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 56.0), egui::Sense::click());
-    let bg_color = if selected || response.hovered() {
+    let bg_color = if selected || response.contains_pointer() {
         HOVER
     } else {
         egui::Color32::TRANSPARENT
@@ -1433,7 +1434,7 @@ fn stats_track_entry(ui: &mut egui::Ui, track: &TrackSummary) -> bool {
         egui::vec2(ui.available_width(), row_height),
         egui::Sense::click(),
     );
-    let is_hovered = response.hovered();
+    let is_hovered = response.contains_pointer();
     if is_hovered {
         ui.painter().rect_filled(rect, 4.0, HOVER);
     }
@@ -1564,7 +1565,7 @@ fn track_list(
                         egui::vec2(ui.available_width(), row_height),
                         egui::Sense::click(),
                     );
-                    let is_hovered = row_resp.hovered();
+                    let is_hovered = row_resp.contains_pointer();
 
                     if is_hovered {
                         ui.painter().rect_filled(row_rect, 4.0, HOVER);

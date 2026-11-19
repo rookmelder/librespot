@@ -130,6 +130,8 @@ impl WebApi {
         struct Item {
             id: String,
             name: String,
+            // Newer answers call the count `items`, older ones `tracks`.
+            items: Option<Tracks>,
             tracks: Option<Tracks>,
         }
         #[derive(Deserialize)]
@@ -144,7 +146,7 @@ impl WebApi {
             playlists.extend(page.items.into_iter().map(|item| PlaylistSummary {
                 id: item.id,
                 name: item.name,
-                track_count: item.tracks.map_or(0, |t| t.total),
+                track_count: item.items.or(item.tracks).map_or(0, |t| t.total),
             }));
             url = next_page(page.next)?;
         }
@@ -159,13 +161,16 @@ impl WebApi {
         }
         let mut tracks = Vec::new();
         let mut url = Some(format!(
-            "{API}/playlists/{playlist_id}/tracks?limit=100&additional_types=track"
+            "{API}/playlists/{playlist_id}/items?limit=100&additional_types=track"
         ));
         while let Some(next) = url {
-            let page: TrackPage = self
-                .get(&next)
-                .await
-                .context("could not load the playlist's tracks")?;
+            let page: TrackPage = match self.get(&next).await {
+                Ok(page) => page,
+                Err(error) if is_forbidden(&error) => {
+                    bail!("Spotify only shows the songs of playlists you own or collaborate on")
+                }
+                Err(error) => return Err(error.context("could not load the playlist's tracks")),
+            };
             tracks.extend(
                 page.items
                     .into_iter()
@@ -221,11 +226,11 @@ struct TrackPage {
     next: Option<String>,
 }
 
-/// One entry of a playlist page. Spotify calls the track `track` (older answers) or `item` (newer ones).
+/// One entry of a playlist page. The track is under `item` (current) or `track` (deprecated).
 #[derive(Deserialize)]
 struct PlaylistEntry {
-    track: Option<ApiTrack>,
     item: Option<ApiTrack>,
+    track: Option<ApiTrack>,
 }
 
 #[derive(Deserialize)]
@@ -247,7 +252,7 @@ struct ApiArtist {
 
 impl PlaylistEntry {
     fn into_summary(self) -> Option<TrackSummary> {
-        let track = self.track.or(self.item)?;
+        let track = self.item.or(self.track)?;
         let uri = track.uri?;
         if track.is_local || !uri.starts_with("spotify:track:") {
             return None;
@@ -264,6 +269,13 @@ impl PlaylistEntry {
             duration_ms: track.duration_ms,
         })
     }
+}
+
+fn is_forbidden(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .any(|e| e.status() == Some(StatusCode::FORBIDDEN))
 }
 
 /// The next page to fetch. Only links on the API host are followed: never send the token anywhere else.

@@ -4,6 +4,11 @@ What happened on rusty-player, newest first. Short entries: what was done, what 
 
 ## 2026-11-19: Phase 5b, playlist tracks, double-click to play
 
+- Fix after the user's test: Spotify deprecated `/playlists/{id}/tracks` (403) for `/playlists/{id}/items`, the
+  track is now under `item` and the count under `items.total` (all playlists showed "(0)"). Spotify only returns
+  songs of playlists the user owns or collaborates on; others now give a clear message instead of "403 Forbidden".
+- Seen: emoji in playlist names show as boxes (egui's default font has no emoji). For the styling pass.
+
 - Click a playlist: its tracks load (Web API `/playlists/{id}/tracks`, 100 per page); double-click a track to play.
   Controls and now-playing moved to a bottom bar. Terminal: `t <playlist id>`.
 - Episodes, local files and removed tracks are skipped. Answers for a playlist you already left are ignored.

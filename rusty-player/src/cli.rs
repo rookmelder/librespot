@@ -24,6 +24,13 @@ pub fn parse_line(line: &str) -> Result<Option<Command>, String> {
         return Ok(None);
     }
 
+    if trimmed.eq_ignore_ascii_case("liked") {
+        return Ok(Some(Command::LoadLikedTracks));
+    }
+    if trimmed.eq_ignore_ascii_case("stats") {
+        return Ok(Some(Command::LoadStats));
+    }
+
     if trimmed.eq_ignore_ascii_case("p") {
         return Ok(Some(Command::Pause));
     }
@@ -83,7 +90,7 @@ pub async fn run(to_file: Option<PathBuf>) -> Result<()> {
     ));
 
     println!(
-        "Commands: <track id or link> = play, p = pause, r = resume, s = stop, v <0-100> = volume, l = list playlists, t <id> = playlist tracks, ? <words> = search, q = quit"
+        "Commands: <track id or link> = play, p = pause, r = resume, s = stop, v <0-100> = volume, l = list playlists, t <id> = playlist tracks, liked = Liked Songs, stats = listening stats, ? <words> = search, q = quit"
     );
 
     // Reading stdin blocks, so it gets its own OS thread instead of a Tokio task.
@@ -130,9 +137,25 @@ pub async fn run(to_file: Option<PathBuf>) -> Result<()> {
                     );
                 }
             }
-            Event::PlaylistTracksLoaded { tracks, .. } | Event::SearchResults { tracks, .. } => {
+            Event::PlaylistTracksLoaded { tracks, .. }
+            | Event::SearchResults { tracks, .. }
+            | Event::LikedTracksLoaded(tracks) => {
                 for track in tracks {
                     println!("{} - {}  {}", track.artists, track.name, track.uri);
+                }
+            }
+            Event::StatsLoaded(stats) => {
+                println!("Recently played:");
+                for track in stats.recently_played {
+                    println!("{} - {}  {}", track.artists, track.name, track.uri);
+                }
+                println!("Top tracks:");
+                for track in stats.top_tracks {
+                    println!("{} - {}  {}", track.artists, track.name, track.uri);
+                }
+                println!("Top artists:");
+                for artist in stats.top_artists {
+                    println!("{artist}");
                 }
             }
             Event::Error(msg) => eprintln!("Error: {msg}"),
@@ -188,6 +211,21 @@ mod tests {
             parse_line(" spotify:track:x "),
             Ok(Some(Command::Play("spotify:track:x".to_string())))
         );
+    }
+
+    #[test]
+    fn parse_liked_and_stats_commands() {
+        for text in ["liked", "LIKED", " LiKeD "] {
+            assert_eq!(parse_line(text), Ok(Some(Command::LoadLikedTracks)));
+        }
+        for text in ["stats", "STATS", " StAtS "] {
+            assert_eq!(parse_line(text), Ok(Some(Command::LoadStats)));
+        }
+        for text in ["liked extra", "stats extra", "liked123", "stats123"] {
+            assert_eq!(parse_line(text), Ok(Some(Command::Play(text.into()))));
+        }
+        assert_eq!(parse_line("l"), Ok(Some(Command::LoadPlaylists)));
+        assert_eq!(parse_line("s"), Ok(Some(Command::Stop)));
     }
 
     #[test]

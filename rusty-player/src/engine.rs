@@ -6,7 +6,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use crate::webapi::{PlaylistSummary, TrackSummary, WebApi};
+use crate::webapi::{PlaylistSummary, Stats, TrackSummary, WebApi};
 use librespot::core::SpotifyUri;
 use librespot::metadata::audio::{AudioItem, UniqueFields};
 use librespot::playback::{
@@ -61,6 +61,10 @@ pub enum Command {
     LoadPlaylists,
     /// Load one playlist's tracks through the Web API (by playlist ID).
     LoadPlaylistTracks(String),
+    /// Load the user's Liked Songs through the Web API.
+    LoadLikedTracks,
+    /// Load recent listening and short-term favorites through the Web API.
+    LoadStats,
     /// Search tracks through the Web API.
     Search(String),
     /// Stop playing, log out and end `run_engine`.
@@ -97,6 +101,10 @@ pub enum Event {
         playlist_id: String,
         tracks: Vec<TrackSummary>,
     },
+    /// Answer to `Command::LoadLikedTracks`.
+    LikedTracksLoaded(Vec<TrackSummary>),
+    /// Answer to `Command::LoadStats`.
+    StatsLoaded(Stats),
     /// Answer to `Command::Search`.
     SearchResults {
         query: String,
@@ -316,6 +324,18 @@ fn handle_command(
                         tracks,
                     })
                 })
+            });
+            Ok(())
+        }
+        Command::LoadLikedTracks => {
+            spawn_web_call(web_api, evt_tx, |api| {
+                Box::pin(async move { api.liked_tracks().await.map(Event::LikedTracksLoaded) })
+            });
+            Ok(())
+        }
+        Command::LoadStats => {
+            spawn_web_call(web_api, evt_tx, |api| {
+                Box::pin(async move { api.stats().await.map(Event::StatsLoaded) })
             });
             Ok(())
         }

@@ -2,6 +2,15 @@
 
 What happened on rusty-player, newest first. Short entries: what was done, what went wrong, what was learned.
 
+## 2026-11-19: Phase 5d, Liked Songs, stats, auto-play next
+
+- Added Liked Songs (left panel entry, Web API `GET /me/tracks`, 50 per page, all pages).
+- Added right "Stats" panel (recently played: `GET /me/player/recently-played?limit=50`; top tracks and top artists: `GET /me/top/{tracks|artists}?limit=20&time_range=short_term`).
+- Auto-play of the next track in the list the user double-clicked from (playlist, Liked Songs, search or stats). Stop does not advance; the text-field Play clears the list.
+- New engine commands/events: `LoadLikedTracks` -> `LikedTracksLoaded`, `LoadStats` -> `StatsLoaded(Stats)`. Terminal: `liked`, `stats`.
+- Who built what: builderplus (GPT-6.1 Sol on Codex) did webapi.rs, engine.rs and cli.rs; builder (Gemini 3.8 Flash Low on agy) did ui.rs (1 fix round).
+- Checks: Lead checked 53 tests pass and clippy clean. No reviewer (routine Web API + UI work). Not tested with the user's account yet.
+
 ## 2026-11-19: Phase 5c, search
 
 - Search bar at the top; results (up to 20: Spotify allows 10 per request, so 2 pages) show in the middle and

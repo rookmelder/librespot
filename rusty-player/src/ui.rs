@@ -15,7 +15,7 @@ use tokio::sync::mpsc::{
 
 use crate::cli::{percent_to_volume, volume_to_percent};
 use crate::engine::{self, Command, EngineConfig, Event, EventSender, TrackInfo};
-use crate::webapi::{PlaylistSummary, TrackSummary};
+use crate::webapi::{PlaylistSummary, Stats, TrackSummary};
 
 /// Open the window and run until it is closed; then stop the engine and wait for it.
 pub fn run(to_file: Option<PathBuf>) -> Result<()> {
@@ -53,7 +53,7 @@ pub fn run(to_file: Option<PathBuf>) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("rusty-player")
-            .with_inner_size([760.0, 400.0]),
+            .with_inner_size([1000.0, 560.0]),
         ..Default::default()
     };
     let window_result = eframe::run_native(
@@ -115,6 +115,13 @@ pub fn playlist_label(p: &PlaylistSummary) -> String {
     format!("{} ({})", p.name, p.track_count)
 }
 
+pub fn next_in_queue(queue: &[String], pos: Option<usize>) -> Option<usize> {
+    match pos {
+        Some(i) if i + 1 < queue.len() => Some(i + 1),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Status {
     LoggingIn,
@@ -139,6 +146,7 @@ fn status_text(status: &Status) -> String {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum View {
     Playlist,
+    Liked,
     Search,
 }
 
@@ -158,10 +166,16 @@ pub struct PlayerApp {
     tracks: Vec<TrackSummary>,
     tracks_loading: bool,
     tracks_for: Option<String>,
+    liked: Vec<TrackSummary>,
+    liked_loading: bool,
+    stats: Option<Stats>,
+    stats_loading: bool,
     search_input: String,
     search_loading: bool,
     search_query: Option<String>,
     search_results: Vec<TrackSummary>,
+    queue: Vec<String>,
+    queue_pos: Option<usize>,
     view: View,
 }
 
@@ -183,10 +197,16 @@ impl PlayerApp {
             tracks: Vec::new(),
             tracks_loading: false,
             tracks_for: None,
+            liked: Vec::new(),
+            liked_loading: false,
+            stats: None,
+            stats_loading: false,
             search_input: String::new(),
             search_loading: false,
             search_query: None,
             search_results: Vec::new(),
+            queue: Vec::new(),
+            queue_pos: None,
             view: View::Playlist,
         }
     }
@@ -232,8 +252,14 @@ impl PlayerApp {
                 self.progress = None;
             }
             Event::EndOfTrack => {
-                self.status = Status::Ended;
                 self.progress = None;
+                if let Some(next_idx) = next_in_queue(&self.queue, self.queue_pos) {
+                    self.queue_pos = Some(next_idx);
+                    let uri = self.queue[next_idx].clone();
+                    self.send(Command::Play(uri));
+                } else {
+                    self.status = Status::Ended;
+                }
             }
             Event::VolumeChanged(v) => {
                 let percent = volume_to_percent(v).min(100) as u8;
@@ -253,6 +279,14 @@ impl PlayerApp {
                     self.tracks_loading = false;
                 }
             }
+            Event::LikedTracksLoaded(tracks) => {
+                self.liked = tracks;
+                self.liked_loading = false;
+            }
+            Event::StatsLoaded(stats) => {
+                self.stats = Some(stats);
+                self.stats_loading = false;
+            }
             Event::SearchResults { query, tracks } => {
                 if Some(&query) == self.search_query.as_ref() {
                     self.search_results = tracks;
@@ -262,6 +296,8 @@ impl PlayerApp {
             Event::Error(msg) => {
                 self.playlists_loading = false;
                 self.tracks_loading = false;
+                self.liked_loading = false;
+                self.stats_loading = false;
                 self.search_loading = false;
                 self.last_error = Some(msg);
             }
@@ -283,15 +319,23 @@ impl PlayerApp {
             self.last_error = Some("the engine has stopped".into());
         }
     }
+
+    fn play_from_list(&mut self, tracks: &[TrackSummary], index: usize) {
+        self.queue = tracks.iter().map(|t| t.uri.clone()).collect();
+        self.queue_pos = Some(index);
+        if let Some(uri) = self.queue.get(index).cloned() {
+            self.send(Command::Play(uri));
+        }
+    }
 }
 
 fn track_list(
     ui: &mut egui::Ui,
     tracks: &[TrackSummary],
     playing_uri: Option<&str>,
-) -> Option<String> {
+) -> Option<usize> {
     let row_height = ui.spacing().interact_size.y;
-    let mut play_track = None;
+    let mut clicked_idx = None;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show_rows(ui, row_height, tracks.len(), |ui, rows| {
@@ -302,11 +346,11 @@ fn track_list(
                 let text = track_row_label(idx + 1, track);
                 let response = ui.selectable_label(is_current, text);
                 if response.double_clicked() {
-                    play_track = Some(track.uri.clone());
+                    clicked_idx = Some(idx);
                 }
             }
         });
-    play_track
+    clicked_idx
 }
 
 impl eframe::App for PlayerApp {
@@ -361,6 +405,18 @@ impl eframe::App for PlayerApp {
                     }
                     None => {
                         ui.label("Logging in...");
+                    }
+                }
+
+                let liked_selected = self.view == View::Liked;
+                if ui
+                    .selectable_label(liked_selected, "♥ Liked Songs")
+                    .clicked()
+                {
+                    self.view = View::Liked;
+                    if self.liked.is_empty() && !self.liked_loading {
+                        self.liked_loading = true;
+                        self.send(Command::LoadLikedTracks);
                     }
                 }
 
@@ -472,6 +528,8 @@ impl eframe::App for PlayerApp {
                     if play_clicked || enter_pressed {
                         let trimmed = self.track_input.trim();
                         if !trimmed.is_empty() {
+                            self.queue.clear();
+                            self.queue_pos = None;
                             self.send(Command::Play(trimmed.to_string()));
                         }
                     }
@@ -505,11 +563,76 @@ impl eframe::App for PlayerApp {
             }
         });
 
+        egui::SidePanel::right("stats")
+            .resizable(true)
+            .default_width(220.0)
+            .show(ctx, |ui| {
+                ui.heading("Stats");
+
+                let button_text = if self.stats.is_none() {
+                    "Load stats"
+                } else {
+                    "Reload"
+                };
+                let can_load = !self.stats_loading && self.username.is_some();
+                if ui
+                    .add_enabled(can_load, egui::Button::new(button_text))
+                    .clicked()
+                {
+                    self.stats_loading = true;
+                    self.send(Command::LoadStats);
+                }
+
+                if self.stats_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading stats...");
+                    });
+                }
+
+                let mut clicked_stats_track = None;
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if let Some(stats) = &self.stats {
+                        ui.collapsing("Recently played", |ui| {
+                            for (idx, track) in stats.recently_played.iter().enumerate() {
+                                let label_text = format!("{} — {}", track.name, track.artists);
+                                let response = ui.selectable_label(false, label_text);
+                                if response.double_clicked() {
+                                    clicked_stats_track =
+                                        Some((stats.recently_played.clone(), idx));
+                                }
+                            }
+                        });
+
+                        ui.collapsing("Top tracks", |ui| {
+                            for (idx, track) in stats.top_tracks.iter().enumerate() {
+                                let label_text = format!("{} — {}", track.name, track.artists);
+                                let response = ui.selectable_label(false, label_text);
+                                if response.double_clicked() {
+                                    clicked_stats_track = Some((stats.top_tracks.clone(), idx));
+                                }
+                            }
+                        });
+
+                        ui.collapsing("Top artists", |ui| {
+                            for (idx, artist) in stats.top_artists.iter().enumerate() {
+                                ui.label(format!("{}. {artist}", idx + 1));
+                            }
+                        });
+                    }
+                });
+
+                if let Some((list, idx)) = clicked_stats_track {
+                    self.play_from_list(&list, idx);
+                }
+            });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let playing_uri = match &self.status {
-                Status::Playing(uri) => Some(uri.as_str()),
+                Status::Playing(uri) => Some(uri.clone()),
                 _ => None,
             };
+            let playing_uri_ref = playing_uri.as_deref();
 
             match self.view {
                 View::Search => {
@@ -526,8 +649,34 @@ impl eframe::App for PlayerApp {
                         });
                     } else if self.search_results.is_empty() {
                         ui.label(egui::RichText::new("No results").weak());
-                    } else if let Some(uri) = track_list(ui, &self.search_results, playing_uri) {
-                        self.send(Command::Play(uri));
+                    } else if let Some(idx) = track_list(ui, &self.search_results, playing_uri_ref)
+                    {
+                        self.play_from_list(&self.search_results.clone(), idx);
+                    }
+                }
+                View::Liked => {
+                    let mut reload_clicked = false;
+                    ui.horizontal(|ui| {
+                        ui.heading("Liked Songs");
+                        if ui.small_button("Reload").clicked() {
+                            reload_clicked = true;
+                        }
+                    });
+
+                    if reload_clicked {
+                        self.liked_loading = true;
+                        self.send(Command::LoadLikedTracks);
+                    }
+
+                    if self.liked_loading {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Loading...");
+                        });
+                    } else if self.liked.is_empty() {
+                        ui.label(egui::RichText::new("No liked tracks").weak());
+                    } else if let Some(idx) = track_list(ui, &self.liked, playing_uri_ref) {
+                        self.play_from_list(&self.liked.clone(), idx);
                     }
                 }
                 View::Playlist => {
@@ -547,8 +696,8 @@ impl eframe::App for PlayerApp {
                     } else if self.selected_playlist.is_some() {
                         if self.tracks.is_empty() {
                             ui.label(egui::RichText::new("No playable tracks").weak());
-                        } else if let Some(uri) = track_list(ui, &self.tracks, playing_uri) {
-                            self.send(Command::Play(uri));
+                        } else if let Some(idx) = track_list(ui, &self.tracks, playing_uri_ref) {
+                            self.play_from_list(&self.tracks.clone(), idx);
                         }
                     }
                 }
@@ -1033,5 +1182,146 @@ mod tests {
             cmd_rx.try_recv(),
             Ok(Command::Play("spotify:track:xyz".into()))
         );
+    }
+
+    #[test]
+    fn test_apply_event_liked_tracks_loaded() {
+        let t0 = Instant::now();
+        let (_evt_tx, mut app) = create_test_app();
+        app.liked_loading = true;
+
+        let liked = vec![TrackSummary {
+            uri: "spotify:track:liked1".into(),
+            name: "Liked Song".into(),
+            artists: "Artist".into(),
+            duration_ms: 180_000,
+        }];
+
+        app.apply_event(Event::LikedTracksLoaded(liked.clone()), t0);
+        assert_eq!(app.liked, liked);
+        assert!(!app.liked_loading);
+    }
+
+    #[test]
+    fn test_apply_event_stats_loaded() {
+        let t0 = Instant::now();
+        let (_evt_tx, mut app) = create_test_app();
+        app.stats_loading = true;
+
+        let stats = Stats {
+            recently_played: vec![TrackSummary {
+                uri: "spotify:track:recent".into(),
+                name: "Recent".into(),
+                artists: "Artist".into(),
+                duration_ms: 120_000,
+            }],
+            top_tracks: vec![TrackSummary {
+                uri: "spotify:track:top".into(),
+                name: "Top".into(),
+                artists: "Artist".into(),
+                duration_ms: 200_000,
+            }],
+            top_artists: vec!["Top Artist".into()],
+        };
+
+        app.apply_event(Event::StatsLoaded(stats.clone()), t0);
+        assert_eq!(app.stats, Some(stats));
+        assert!(!app.stats_loading);
+    }
+
+    #[test]
+    fn test_apply_event_error_clears_liked_and_stats_loading() {
+        let t0 = Instant::now();
+        let (_evt_tx, mut app) = create_test_app();
+        app.liked_loading = true;
+        app.stats_loading = true;
+
+        app.apply_event(Event::Error("fetch failed".into()), t0);
+        assert!(!app.liked_loading);
+        assert!(!app.stats_loading);
+        assert_eq!(app.last_error.as_deref(), Some("fetch failed"));
+    }
+
+    #[test]
+    fn test_next_in_queue() {
+        let q = vec![
+            "spotify:track:1".to_string(),
+            "spotify:track:2".to_string(),
+            "spotify:track:3".to_string(),
+        ];
+
+        // middle -> next
+        assert_eq!(next_in_queue(&q, Some(0)), Some(1));
+        assert_eq!(next_in_queue(&q, Some(1)), Some(2));
+        // last -> None
+        assert_eq!(next_in_queue(&q, Some(2)), None);
+        // None -> None
+        assert_eq!(next_in_queue(&q, None), None);
+        // empty -> None
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(next_in_queue(&empty, None), None);
+        assert_eq!(next_in_queue(&empty, Some(0)), None);
+    }
+
+    #[test]
+    fn test_end_of_track_with_queue_advances_and_plays() {
+        let t0 = Instant::now();
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = unbounded_channel();
+        let mut app = PlayerApp::new(cmd_tx, evt_rx);
+
+        app.queue = vec![
+            "spotify:track:1".into(),
+            "spotify:track:2".into(),
+            "spotify:track:3".into(),
+        ];
+        app.queue_pos = Some(0);
+        app.status = Status::Playing("spotify:track:1".into());
+
+        app.apply_event(Event::EndOfTrack, t0);
+
+        assert_eq!(app.queue_pos, Some(1));
+        assert_eq!(
+            cmd_rx.try_recv(),
+            Ok(Command::Play("spotify:track:2".into()))
+        );
+        // status is not ended because next play command was sent
+        assert_ne!(app.status, Status::Ended);
+    }
+
+    #[test]
+    fn test_end_of_track_at_end_of_queue_ends_and_sends_nothing() {
+        let t0 = Instant::now();
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = unbounded_channel();
+        let mut app = PlayerApp::new(cmd_tx, evt_rx);
+
+        app.queue = vec!["spotify:track:1".into(), "spotify:track:2".into()];
+        app.queue_pos = Some(1);
+        app.status = Status::Playing("spotify:track:2".into());
+
+        app.apply_event(Event::EndOfTrack, t0);
+
+        assert_eq!(app.status, Status::Ended);
+        assert_eq!(app.queue_pos, Some(1));
+        assert_eq!(cmd_rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn test_stopped_never_sends_play_and_does_not_advance_queue() {
+        let t0 = Instant::now();
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = unbounded_channel();
+        let mut app = PlayerApp::new(cmd_tx, evt_rx);
+
+        app.queue = vec!["spotify:track:1".into(), "spotify:track:2".into()];
+        app.queue_pos = Some(0);
+        app.status = Status::Playing("spotify:track:1".into());
+
+        app.apply_event(Event::Stopped, t0);
+
+        assert_eq!(app.status, Status::Stopped);
+        assert_eq!(app.queue_pos, Some(0));
+        assert_eq!(cmd_rx.try_recv(), Err(TryRecvError::Empty));
     }
 }

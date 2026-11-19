@@ -52,6 +52,14 @@ pub struct TrackSummary {
     pub duration_ms: u32,
 }
 
+/// The user's recent listening and short-term favorites.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Stats {
+    pub recently_played: Vec<TrackSummary>,
+    pub top_tracks: Vec<TrackSummary>,
+    pub top_artists: Vec<String>,
+}
+
 /// The token as saved on disk. Expiry is wall-clock time, because `Instant` cannot be saved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SavedToken {
@@ -183,6 +191,77 @@ impl WebApi {
         Ok(tracks)
     }
 
+    /// All playable Liked Songs, following the paging until the end.
+    pub async fn liked_tracks(&mut self) -> Result<Vec<TrackSummary>> {
+        let mut tracks = Vec::new();
+        let mut url = Some(format!("{API}/me/tracks?limit=50"));
+        while let Some(next) = url {
+            let page: TrackPage = self
+                .get(&next)
+                .await
+                .context("could not load Liked Songs")?;
+            tracks.extend(
+                page.items
+                    .into_iter()
+                    .filter_map(PlaylistEntry::into_summary),
+            );
+            url = next_page(page.next)?;
+        }
+        Ok(tracks)
+    }
+
+    /// The most recent page of played tracks, in the API's order.
+    pub async fn recently_played(&mut self) -> Result<Vec<TrackSummary>> {
+        let page: TrackPage = self
+            .get(&format!("{API}/me/player/recently-played?limit=50"))
+            .await
+            .context("could not load recently played tracks")?;
+        Ok(page
+            .items
+            .into_iter()
+            .filter_map(PlaylistEntry::into_summary)
+            .collect())
+    }
+
+    /// The user's top tracks over the short term, in rank order.
+    pub async fn top_tracks(&mut self) -> Result<Vec<TrackSummary>> {
+        let page: TopTracksPage = self
+            .get(&format!(
+                "{API}/me/top/tracks?limit=20&time_range=short_term"
+            ))
+            .await
+            .context("could not load top tracks")?;
+        Ok(page
+            .items
+            .into_iter()
+            .flatten()
+            .filter_map(ApiTrack::into_summary)
+            .collect())
+    }
+
+    /// The user's top artist names over the short term, in rank order.
+    pub async fn top_artists(&mut self) -> Result<Vec<String>> {
+        let page: TopArtistsPage = self
+            .get(&format!(
+                "{API}/me/top/artists?limit=20&time_range=short_term"
+            ))
+            .await
+            .context("could not load top artists")?;
+        Ok(page.items.into_iter().map(|artist| artist.name).collect())
+    }
+
+    /// Load the three listening statistics in sequence.
+    pub async fn stats(&mut self) -> Result<Stats> {
+        let recently_played = self.recently_played().await?;
+        let top_tracks = self.top_tracks().await?;
+        let top_artists = self.top_artists().await?;
+        Ok(Stats {
+            recently_played,
+            top_tracks,
+            top_artists,
+        })
+    }
+
     /// Search tracks. Spotify returns at most 10 per request, so this fetches up to `SEARCH_PAGES` pages.
     pub async fn search_tracks(&mut self, query: &str) -> Result<Vec<TrackSummary>> {
         let query = query.trim();
@@ -257,6 +336,16 @@ impl WebApi {
 struct TrackPage {
     items: Vec<PlaylistEntry>,
     next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TopTracksPage {
+    items: Vec<Option<ApiTrack>>,
+}
+
+#[derive(Deserialize)]
+struct TopArtistsPage {
+    items: Vec<ApiArtist>,
 }
 
 /// One entry of a playlist page. The track is under `item` (current) or `track` (deprecated).
@@ -411,6 +500,116 @@ mod tests {
         assert_eq!(tracks[0].artists, "A, B");
         assert_eq!(tracks[0].duration_ms, 61000);
         assert_eq!(tracks[1].name, "New shape");
+    }
+
+    #[test]
+    fn recently_played_keeps_order_and_skips_null_tracks() {
+        let page: TrackPage = serde_json::from_str(
+            r#"{"items": [
+                {"track": {"uri": "spotify:track:first", "name": "First", "duration_ms": 1000,
+                           "artists": [{"name": "A"}]}, "played_at": "2026-01-02T12:00:00Z"},
+                {"track": null, "played_at": "2026-01-02T11:00:00Z"},
+                {"track": {"uri": "spotify:track:second", "name": "Second", "duration_ms": 2000,
+                           "artists": [{"name": "B"}, {"name": "C"}]}, "played_at": "2026-01-01T12:00:00Z"}
+            ], "next": "https://api.spotify.com/v1/me/player/recently-played?before=1"}"#,
+        )
+        .unwrap();
+        let tracks: Vec<TrackSummary> = page
+            .items
+            .into_iter()
+            .filter_map(PlaylistEntry::into_summary)
+            .collect();
+        assert_eq!(
+            tracks,
+            vec![
+                TrackSummary {
+                    uri: "spotify:track:first".into(),
+                    name: "First".into(),
+                    artists: "A".into(),
+                    duration_ms: 1000,
+                },
+                TrackSummary {
+                    uri: "spotify:track:second".into(),
+                    name: "Second".into(),
+                    artists: "B, C".into(),
+                    duration_ms: 2000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn top_tracks_reads_direct_track_objects() {
+        let page: TopTracksPage = serde_json::from_str(
+            r#"{"items": [
+                {"uri": "spotify:track:first", "name": "First", "duration_ms": 1000,
+                 "artists": [{"name": "A"}]},
+                null,
+                {"uri": "spotify:episode:episode", "name": "Episode"},
+                {"uri": "spotify:track:second", "name": "Second", "artists": []}
+            ], "next": null}"#,
+        )
+        .unwrap();
+        let tracks: Vec<TrackSummary> = page
+            .items
+            .into_iter()
+            .flatten()
+            .filter_map(ApiTrack::into_summary)
+            .collect();
+        assert_eq!(
+            tracks,
+            vec![
+                TrackSummary {
+                    uri: "spotify:track:first".into(),
+                    name: "First".into(),
+                    artists: "A".into(),
+                    duration_ms: 1000,
+                },
+                TrackSummary {
+                    uri: "spotify:track:second".into(),
+                    name: "Second".into(),
+                    artists: String::new(),
+                    duration_ms: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn top_artists_keeps_names_in_rank_order() {
+        let page: TopArtistsPage = serde_json::from_str(
+            r#"{"items": [{"name": "Z Artist", "id": "first"}, {"name": "A Artist"}], "next": null}"#,
+        )
+        .unwrap();
+        let names: Vec<String> = page.items.into_iter().map(|artist| artist.name).collect();
+        assert_eq!(names, vec!["Z Artist", "A Artist"]);
+    }
+
+    #[test]
+    fn liked_tracks_reads_track_entries() {
+        let page: TrackPage = serde_json::from_str(
+            r#"{"next": null, "items": [
+                {"track": {"uri": "spotify:track:liked", "name": "Liked", "duration_ms": 3000,
+                           "artists": [{"name": "Artist"}]}, "added_at": "2026-01-01T12:00:00Z"},
+                {"track": null},
+                {"track": {"uri": "spotify:local:local", "is_local": true}}
+            ]}"#,
+        )
+        .unwrap();
+        let tracks: Vec<TrackSummary> = page
+            .items
+            .into_iter()
+            .filter_map(PlaylistEntry::into_summary)
+            .collect();
+        assert_eq!(
+            tracks,
+            vec![TrackSummary {
+                uri: "spotify:track:liked".into(),
+                name: "Liked".into(),
+                artists: "Artist".into(),
+                duration_ms: 3000,
+            }]
+        );
     }
 
     #[test]

@@ -4,14 +4,17 @@
 use std::{
     path::PathBuf,
     sync::{Arc, OnceLock},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow};
 use eframe::egui;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{
+    UnboundedReceiver, UnboundedSender, error::TryRecvError, unbounded_channel,
+};
 
 use crate::cli::{percent_to_volume, volume_to_percent};
-use crate::engine::{self, Command, EngineConfig, Event, EventSender};
+use crate::engine::{self, Command, EngineConfig, Event, EventSender, TrackInfo};
 
 /// Open the window and run until it is closed; then stop the engine and wait for it.
 pub fn run(to_file: Option<PathBuf>) -> Result<()> {
@@ -46,7 +49,7 @@ pub fn run(to_file: Option<PathBuf>) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("rusty-player")
-            .with_inner_size([480.0, 260.0]),
+            .with_inner_size([520.0, 360.0]),
         ..Default::default()
     };
     let window_result = eframe::run_native(
@@ -54,6 +57,8 @@ pub fn run(to_file: Option<PathBuf>) -> Result<()> {
         options,
         Box::new(move |cc| {
             let _ = ctx_slot.set(cc.egui_ctx.clone());
+            // Lets `ui.image(url)` download and show the album cover (http + jpeg/png).
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(PlayerApp::new(cmd_tx, evt_rx)))
         }),
     );
@@ -65,6 +70,32 @@ pub fn run(to_file: Option<PathBuf>) -> Result<()> {
         .map_err(|_| anyhow!("the engine thread panicked"));
     window_result.map_err(|e| anyhow!("window error: {e}"))?;
     engine_result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Progress {
+    position_ms: u32,
+    since: Instant,
+    running: bool,
+}
+
+impl Progress {
+    fn at(&self, now: Instant) -> u32 {
+        if self.running {
+            let elapsed = u32::try_from(now.saturating_duration_since(self.since).as_millis())
+                .unwrap_or(u32::MAX);
+            self.position_ms.saturating_add(elapsed)
+        } else {
+            self.position_ms
+        }
+    }
+}
+
+pub fn format_time(ms: u32) -> String {
+    let total_seconds = ms / 1000;
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    format!("{minutes}:{seconds:02}")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,6 +127,8 @@ pub struct PlayerApp {
     status: Status,
     username: Option<String>,
     last_error: Option<String>,
+    progress: Option<Progress>,
+    track: Option<TrackInfo>,
 }
 
 impl PlayerApp {
@@ -108,27 +141,54 @@ impl PlayerApp {
             status: Status::LoggingIn,
             username: None,
             last_error: None,
+            progress: None,
+            track: None,
         }
     }
 
-    fn apply_event(&mut self, event: Event) {
+    fn apply_event(&mut self, event: Event, now: Instant) {
         match event {
             Event::LoggedIn { username } => {
                 self.username = Some(username);
                 self.status = Status::Idle;
             }
-            Event::Playing { track_id } => {
+            Event::Playing {
+                track_id,
+                position_ms,
+            } => {
                 self.status = Status::Playing(track_id);
                 self.last_error = None;
+                self.progress = Some(Progress {
+                    position_ms,
+                    since: now,
+                    running: true,
+                });
             }
-            Event::Paused => {
+            Event::Paused { position_ms } => {
                 self.status = Status::Paused;
+                self.progress = Some(Progress {
+                    position_ms,
+                    since: now,
+                    running: false,
+                });
+            }
+            Event::Position { position_ms } => {
+                if let Some(ref mut progress) = self.progress {
+                    progress.position_ms = position_ms;
+                    progress.since = now;
+                }
+            }
+            Event::TrackInfo(info) => {
+                self.track = Some(info);
+                self.progress = None;
             }
             Event::Stopped => {
                 self.status = Status::Stopped;
+                self.progress = None;
             }
             Event::EndOfTrack => {
                 self.status = Status::Ended;
+                self.progress = None;
             }
             Event::VolumeChanged(v) => {
                 let percent = volume_to_percent(v).min(100) as u8;
@@ -137,6 +197,16 @@ impl PlayerApp {
             Event::Error(msg) => {
                 self.last_error = Some(msg);
             }
+        }
+    }
+
+    /// Called once the engine's event channel is closed.
+    fn engine_gone(&mut self) {
+        if let Some(progress) = self.progress.as_mut() {
+            progress.running = false;
+        }
+        if self.last_error.is_none() {
+            self.last_error = Some("the engine has stopped".into());
         }
     }
 
@@ -149,8 +219,18 @@ impl PlayerApp {
 
 impl eframe::App for PlayerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        while let Ok(event) = self.evt_rx.try_recv() {
-            self.apply_event(event);
+        let now = Instant::now();
+        loop {
+            match self.evt_rx.try_recv() {
+                Ok(event) => self.apply_event(event, now),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The engine has ended (login failed, player died): freeze the clock so the bar stops
+                    // moving and nothing keeps repainting.
+                    self.engine_gone();
+                    break;
+                }
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -161,6 +241,43 @@ impl eframe::App for PlayerApp {
                 }
                 None => {
                     ui.label("Logging in...");
+                }
+            }
+
+            if let Some(track) = &self.track {
+                ui.horizontal(|ui| {
+                    if let Some(ref url) = track.cover_url {
+                        ui.add(
+                            egui::Image::new(url.as_str())
+                                .fit_to_exact_size(egui::vec2(120.0, 120.0))
+                                .corner_radius(4.0),
+                        );
+                    } else {
+                        ui.allocate_exact_size(egui::vec2(120.0, 120.0), egui::Sense::hover());
+                    }
+
+                    ui.vertical(|ui| {
+                        ui.heading(&track.title);
+                        ui.label(&track.artists);
+                        ui.label(egui::RichText::new(&track.album).weak());
+                    });
+                });
+
+                if track.duration_ms > 0 {
+                    let position = self
+                        .progress
+                        .map(|p| p.at(now))
+                        .unwrap_or(0)
+                        .min(track.duration_ms);
+                    let fraction = (position as f32 / track.duration_ms as f32).clamp(0.0, 1.0);
+                    ui.horizontal(|ui| {
+                        ui.add(egui::ProgressBar::new(fraction).desired_width(300.0));
+                        ui.label(format!(
+                            "{} / {}",
+                            format_time(position),
+                            format_time(track.duration_ms)
+                        ));
+                    });
                 }
             }
 
@@ -210,12 +327,17 @@ impl eframe::App for PlayerApp {
                 ui.label(egui::RichText::new(format!("Error: {msg}")).color(egui::Color32::RED));
             }
         });
+
+        if self.progress.is_some_and(|p| p.running) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn create_test_app() -> (UnboundedSender<Event>, PlayerApp) {
         let (cmd_tx, _cmd_rx) = unbounded_channel();
@@ -224,71 +346,214 @@ mod tests {
     }
 
     #[test]
+    fn test_progress_at() {
+        let t0 = Instant::now();
+        let p_running = Progress {
+            position_ms: 1000,
+            since: t0,
+            running: true,
+        };
+        // running adds elapsed: position 1000, 2500 ms later -> 3500
+        assert_eq!(p_running.at(t0 + Duration::from_millis(2500)), 3500);
+
+        // not running ignores elapsed
+        let p_paused = Progress {
+            position_ms: 1000,
+            since: t0,
+            running: false,
+        };
+        assert_eq!(p_paused.at(t0 + Duration::from_millis(2500)), 1000);
+
+        // now earlier than since gives position_ms (no panic)
+        assert_eq!(p_running.at(t0 - Duration::from_millis(500)), 1000);
+        assert_eq!(p_paused.at(t0 - Duration::from_millis(500)), 1000);
+    }
+
+    #[test]
+    fn test_format_time() {
+        assert_eq!(format_time(0), "0:00");
+        assert_eq!(format_time(61_000), "1:01");
+        assert_eq!(format_time(3_599_999), "59:59");
+        assert_eq!(format_time(3_600_000), "60:00");
+    }
+
+    #[test]
     fn test_apply_event_logged_in() {
+        let t0 = Instant::now();
         let (_evt_tx, mut app) = create_test_app();
         assert_eq!(app.status, Status::LoggingIn);
         assert_eq!(app.username, None);
 
-        app.apply_event(Event::LoggedIn {
-            username: "testuser".into(),
-        });
+        app.apply_event(
+            Event::LoggedIn {
+                username: "testuser".into(),
+            },
+            t0,
+        );
         assert_eq!(app.username.as_deref(), Some("testuser"));
         assert_eq!(app.status, Status::Idle);
     }
 
     #[test]
-    fn test_apply_event_playing_and_clears_last_error() {
+    fn test_apply_event_playing() {
+        let t0 = Instant::now();
         let (_evt_tx, mut app) = create_test_app();
         app.last_error = Some("previous error".into());
 
-        app.apply_event(Event::Playing {
-            track_id: "spotify:track:xyz".into(),
-        });
+        app.apply_event(
+            Event::Playing {
+                track_id: "spotify:track:xyz".into(),
+                position_ms: 500,
+            },
+            t0,
+        );
         assert_eq!(app.status, Status::Playing("spotify:track:xyz".into()));
         assert_eq!(app.last_error, None);
+        assert_eq!(
+            app.progress,
+            Some(Progress {
+                position_ms: 500,
+                since: t0,
+                running: true,
+            })
+        );
     }
 
     #[test]
-    fn test_apply_event_playback_states() {
+    fn test_apply_event_paused() {
+        let t0 = Instant::now();
         let (_evt_tx, mut app) = create_test_app();
 
-        app.apply_event(Event::Paused);
+        app.apply_event(Event::Paused { position_ms: 1200 }, t0);
         assert_eq!(app.status, Status::Paused);
+        assert_eq!(
+            app.progress,
+            Some(Progress {
+                position_ms: 1200,
+                since: t0,
+                running: false,
+            })
+        );
+    }
 
-        app.apply_event(Event::Stopped);
+    #[test]
+    fn test_apply_event_position() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(500);
+        let (_evt_tx, mut app) = create_test_app();
+
+        // Position with no progress is ignored
+        app.apply_event(Event::Position { position_ms: 2000 }, t0);
+        assert_eq!(app.progress, None);
+
+        // Position keeps running state and moves position
+        app.progress = Some(Progress {
+            position_ms: 1000,
+            since: t0,
+            running: true,
+        });
+        app.apply_event(Event::Position { position_ms: 3000 }, t1);
+        assert_eq!(
+            app.progress,
+            Some(Progress {
+                position_ms: 3000,
+                since: t1,
+                running: true,
+            })
+        );
+
+        app.progress = Some(Progress {
+            position_ms: 1000,
+            since: t0,
+            running: false,
+        });
+        app.apply_event(Event::Position { position_ms: 4000 }, t1);
+        assert_eq!(
+            app.progress,
+            Some(Progress {
+                position_ms: 4000,
+                since: t1,
+                running: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_apply_event_track_info() {
+        let t0 = Instant::now();
+        let (_evt_tx, mut app) = create_test_app();
+        app.progress = Some(Progress {
+            position_ms: 500,
+            since: t0,
+            running: true,
+        });
+
+        let info = TrackInfo {
+            title: "Test Title".into(),
+            artists: "Test Artist".into(),
+            album: "Test Album".into(),
+            duration_ms: 180_000,
+            cover_url: Some("https://example.com/cover.jpg".into()),
+        };
+
+        app.apply_event(Event::TrackInfo(info.clone()), t0);
+        assert_eq!(app.track, Some(info));
+        assert_eq!(app.progress, None);
+    }
+
+    #[test]
+    fn test_apply_event_stopped_and_end_of_track() {
+        let t0 = Instant::now();
+        let (_evt_tx, mut app) = create_test_app();
+        app.progress = Some(Progress {
+            position_ms: 1000,
+            since: t0,
+            running: true,
+        });
+
+        app.apply_event(Event::Stopped, t0);
         assert_eq!(app.status, Status::Stopped);
+        assert_eq!(app.progress, None);
 
-        app.apply_event(Event::EndOfTrack);
+        app.progress = Some(Progress {
+            position_ms: 2000,
+            since: t0,
+            running: true,
+        });
+        app.apply_event(Event::EndOfTrack, t0);
         assert_eq!(app.status, Status::Ended);
+        assert_eq!(app.progress, None);
     }
 
     #[test]
     fn test_apply_event_volume_changed() {
+        let t0 = Instant::now();
         let (_evt_tx, mut app) = create_test_app();
 
-        app.apply_event(Event::VolumeChanged(32767));
+        app.apply_event(Event::VolumeChanged(32767), t0);
         assert_eq!(app.volume_percent, 50);
 
-        app.apply_event(Event::VolumeChanged(65535));
+        app.apply_event(Event::VolumeChanged(65535), t0);
         assert_eq!(app.volume_percent, 100);
 
-        app.apply_event(Event::VolumeChanged(0));
+        app.apply_event(Event::VolumeChanged(0), t0);
         assert_eq!(app.volume_percent, 0);
     }
 
     #[test]
     fn test_apply_event_error_handling() {
+        let t0 = Instant::now();
         let (_evt_tx, mut app) = create_test_app();
 
         // Error while LoggingIn keeps LoggingIn and sets last_error
         assert_eq!(app.status, Status::LoggingIn);
-        app.apply_event(Event::Error("login failed".into()));
+        app.apply_event(Event::Error("login failed".into()), t0);
         assert_eq!(app.status, Status::LoggingIn);
         assert_eq!(app.last_error.as_deref(), Some("login failed"));
 
         // Error while Playing keeps Playing
         app.status = Status::Playing("spotify:track:123".into());
-        app.apply_event(Event::Error("stream warning".into()));
+        app.apply_event(Event::Error("stream warning".into()), t0);
         assert_eq!(app.status, Status::Playing("spotify:track:123".into()));
         assert_eq!(app.last_error.as_deref(), Some("stream warning"));
     }

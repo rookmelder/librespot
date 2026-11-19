@@ -2,6 +2,20 @@
 
 What happened on rusty-player, newest first. Short entries: what was done, what went wrong, what was learned.
 
+## 2026-11-19: Phase 4, now playing (title, artists, album, cover, progress)
+
+- Engine: librespot's `TrackChanged` event already carries name, artists, album, length and cover URLs, so no
+  separate metadata lookup was needed. New events `TrackInfo`, `Position`; `Playing`/`Paused` carry the position.
+- Window: cover (120x120, downloaded by egui_extras' http + image loaders), title, artists, album, progress bar
+  with "m:ss / m:ss". The bar is a clock: last known position + time since; it repaints 4x/s only while playing.
+- Who built what: Lead the engine events and image loader setup; builder (Gemini 3.8 Flash Low) the window,
+  first try. rust-reviewer (GPT-6 Astra) found 2 real issues, fixed by the Lead: the clock could wrap after
+  ~49 days, and the bar kept running if the engine died.
+- Tested: terminal mode prints "Rick Astley - Never Gonna Give You Up ..." for a track (silent). The window could
+  not be screenshotted this time (Windows denied input/screen access), so the look is not checked yet.
+- Lesson: the Claude app's %APPDATA% is a private sandbox copy: a login saved there is invisible to the user's
+  own terminal. The user logged in once from their own terminal.
+
 ## 2026-11-19: Phase 3, the first window
 
 - `rusty-player` now opens an egui window (eframe 0.32.3, the newest that fits Rust 1.85); `--cli` keeps the

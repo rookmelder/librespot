@@ -7,6 +7,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use librespot::core::SpotifyUri;
+use librespot::metadata::audio::{AudioItem, UniqueFields};
 use librespot::playback::{
     audio_backend,
     config::{AudioFormat, PlayerConfig},
@@ -61,13 +62,40 @@ pub enum Command {
 /// What the engine tells the controller.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    LoggedIn { username: String },
-    Playing { track_id: String },
-    Paused,
+    LoggedIn {
+        username: String,
+    },
+    /// Playback (re)started at `position_ms` into the track.
+    Playing {
+        track_id: String,
+        position_ms: u32,
+    },
+    Paused {
+        position_ms: u32,
+    },
+    /// The position jumped (seek or correction) while playing or paused.
+    Position {
+        position_ms: u32,
+    },
+    /// Info about the track that was just loaded.
+    TrackInfo(TrackInfo),
     Stopped,
     EndOfTrack,
     VolumeChanged(u16),
     Error(String),
+}
+
+/// What the window shows about the current track.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TrackInfo {
+    pub title: String,
+    /// Artist names joined with ", ". Empty for podcast episodes without a show name.
+    pub artists: String,
+    /// Album name (or the show name for a podcast episode).
+    pub album: String,
+    pub duration_ms: u32,
+    /// The widest cover image librespot knows, if any.
+    pub cover_url: Option<String>,
 }
 
 /// How the engine plays audio.
@@ -259,10 +287,22 @@ fn handle_command(
 
 fn map_player_event(ev: &PlayerEvent) -> Option<Event> {
     match ev {
-        PlayerEvent::Playing { track_id, .. } => Some(Event::Playing {
+        PlayerEvent::Playing {
+            track_id,
+            position_ms,
+            ..
+        } => Some(Event::Playing {
             track_id: player_track_uri(track_id),
+            position_ms: *position_ms,
         }),
-        PlayerEvent::Paused { .. } => Some(Event::Paused),
+        PlayerEvent::Paused { position_ms, .. } => Some(Event::Paused {
+            position_ms: *position_ms,
+        }),
+        PlayerEvent::Seeked { position_ms, .. }
+        | PlayerEvent::PositionCorrection { position_ms, .. } => Some(Event::Position {
+            position_ms: *position_ms,
+        }),
+        PlayerEvent::TrackChanged { audio_item } => Some(Event::TrackInfo(track_info(audio_item))),
         PlayerEvent::Stopped { .. } => Some(Event::Stopped),
         PlayerEvent::EndOfTrack { .. } => Some(Event::EndOfTrack),
         PlayerEvent::Unavailable { track_id, .. } => Some(Event::Error(format!(
@@ -270,6 +310,35 @@ fn map_player_event(ev: &PlayerEvent) -> Option<Event> {
             player_track_uri(track_id)
         ))),
         _ => None,
+    }
+}
+
+fn track_info(item: &AudioItem) -> TrackInfo {
+    let (artists, album) = match &item.unique_fields {
+        UniqueFields::Track { artists, album, .. } => (
+            artists
+                .iter()
+                .map(|artist| artist.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            album.clone(),
+        ),
+        UniqueFields::Local { artists, album, .. } => (
+            artists.clone().unwrap_or_default(),
+            album.clone().unwrap_or_default(),
+        ),
+        UniqueFields::Episode { show_name, .. } => (String::new(), show_name.clone()),
+    };
+    TrackInfo {
+        title: item.name.clone(),
+        artists,
+        album,
+        duration_ms: item.duration_ms,
+        cover_url: item
+            .covers
+            .iter()
+            .max_by_key(|cover| cover.width)
+            .map(|cover| cover.url.clone()),
     }
 }
 
@@ -299,6 +368,7 @@ mod tests {
             map_player_event(&event),
             Some(Event::Playing {
                 track_id: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".into(),
+                position_ms: 123,
             })
         );
     }
@@ -311,7 +381,7 @@ mod tests {
                 track_id: track_uri(),
                 position_ms: 123,
             }),
-            Some(Event::Paused)
+            Some(Event::Paused { position_ms: 123 })
         );
     }
 
@@ -360,6 +430,18 @@ mod tests {
                 position_ms: 0,
             }),
             None
+        );
+    }
+
+    #[test]
+    fn map_player_event_seeked_gives_position() {
+        assert_eq!(
+            map_player_event(&PlayerEvent::Seeked {
+                play_request_id: 1,
+                track_id: track_uri(),
+                position_ms: 4567,
+            }),
+            Some(Event::Position { position_ms: 4567 })
         );
     }
 

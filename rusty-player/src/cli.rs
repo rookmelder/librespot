@@ -94,8 +94,12 @@ pub async fn run(to_file: Option<PathBuf>) -> Result<()> {
     while let Some(event) = evt_rx.recv().await {
         match event {
             Event::LoggedIn { username } => println!("Logged in as {username}"),
-            Event::Playing { track_id } => println!("Playing {track_id}"),
-            Event::Paused => println!("Paused"),
+            Event::Playing { track_id, .. } => println!("Playing {track_id}"),
+            Event::Paused { .. } => println!("Paused"),
+            Event::Position { .. } => {}
+            Event::TrackInfo(info) => {
+                println!("Track: {} - {} ({})", info.artists, info.title, info.album)
+            }
             Event::Stopped => println!("Stopped"),
             Event::EndOfTrack => println!("Track ended"),
             Event::VolumeChanged(v) => println!("Volume {}%", volume_to_percent(v)),

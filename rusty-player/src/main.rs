@@ -1,45 +1,65 @@
 //! rusty-player: a lightweight Spotify desktop player for Windows, built on librespot.
-//!
-//! Phase 1: a command-line program.
-//! - `rusty-player`                              log in with the cached credentials, show who you are, exit. No sound.
-//! - `rusty-player play <track>`                 play one track on the speakers, exit when it ends (or on Ctrl+C).
-//! - `rusty-player play <track> --to-file <f>`   decode the track into a raw PCM file instead: silent.
-//!
-//! `<track>` is a Spotify track ID, a `spotify:track:` URI, or an `open.spotify.com/track/` link.
 
-use std::path::PathBuf;
+mod engine;
+mod login;
+mod track;
 
 use anyhow::{Context, Result, bail};
-use librespot::{
-    core::{
-        SpotifyUri, authentication::Credentials, cache::Cache, config::SessionConfig,
-        session::Session, spotify_id::SpotifyId,
-    },
-    playback::{
-        audio_backend,
-        config::{AudioFormat, PlayerConfig},
-        mixer::NoOpVolume,
-        player::Player,
-    },
-};
-use log::info;
+use engine::{Command, EngineConfig, Event};
+use std::path::PathBuf;
 
-/// What the user asked for on the command line.
-#[derive(Debug, PartialEq)]
-enum Action {
-    /// Only log in and print the account: never plays anything.
-    Login,
-    /// Play one track, on the speakers (`to_file: None`) or into a file.
-    Play {
-        track: SpotifyId,
-        to_file: Option<PathBuf>,
-    },
+const USAGE: &str = "usage: rusty-player [--to-file <path>]\n  --to-file <path>   write decoded audio to a file instead of the speakers (silent)";
+
+pub fn parse_args(args: &[String]) -> Result<Option<PathBuf>> {
+    match args {
+        [] => Ok(None),
+        [flag, path] if flag == "--to-file" => Ok(Some(PathBuf::from(path))),
+        _ => bail!("{USAGE}"),
+    }
 }
 
-const USAGE: &str = "usage:
-  rusty-player                              log in and show the account (no sound)
-  rusty-player play <track>                 play one track on the speakers
-  rusty-player play <track> --to-file <f>   write the decoded audio to a file (no sound)";
+pub fn percent_to_volume(percent: u8) -> u16 {
+    (percent as u32 * 65535 / 100) as u16
+}
+
+pub fn volume_to_percent(volume: u16) -> u16 {
+    ((volume as u32 * 100 + 32767) / 65535) as u16
+}
+
+pub fn parse_line(line: &str) -> Result<Option<Command>, String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if trimmed.eq_ignore_ascii_case("p") {
+        return Ok(Some(Command::Pause));
+    }
+    if trimmed.eq_ignore_ascii_case("r") {
+        return Ok(Some(Command::Resume));
+    }
+    if trimmed.eq_ignore_ascii_case("s") {
+        return Ok(Some(Command::Stop));
+    }
+    if trimmed.eq_ignore_ascii_case("q") {
+        return Ok(Some(Command::Quit));
+    }
+
+    // A volume command is "v" alone or "v" + space + number. A track ID can start with "v" too
+    // ("vXyz..."), so a "v" glued to more text is a track, not a volume.
+    let (first, rest) = trimmed
+        .split_once(char::is_whitespace)
+        .unwrap_or((trimmed, ""));
+    if first.eq_ignore_ascii_case("v") {
+        let rest = rest.trim();
+        match rest.parse::<u8>() {
+            Ok(n) if n <= 100 => Ok(Some(Command::SetVolume(percent_to_volume(n)))),
+            _ => Err("volume must be a number from 0 to 100".to_string()),
+        }
+    } else {
+        Ok(Some(Command::Play(trimmed.to_string())))
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -48,193 +68,140 @@ async fn main() -> Result<()> {
     )
     .init();
 
-    // `args_os` instead of `args`: `args` panics on an argument that is not valid Unicode.
-    let args = std::env::args_os()
-        .skip(1)
-        .map(|arg| {
-            arg.into_string().map_err(|bad| {
-                anyhow::anyhow!("argument is not valid text: {}", bad.to_string_lossy())
-            })
-        })
-        .collect::<Result<Vec<String>>>()?;
-    let action = parse_args(&args)?;
-
-    let session = connect().await?;
-    info!("Logged in as {}", session.username());
-
-    let result = match action {
-        Action::Login => {
-            println!("Logged in as {}. Nothing to play.", session.username());
-            Ok(())
+    let mut args = Vec::new();
+    for arg in std::env::args_os().skip(1) {
+        match arg.into_string() {
+            Ok(s) => args.push(s),
+            Err(_) => bail!("{USAGE}"),
         }
-        Action::Play { track, to_file } => play(&session, track, to_file).await,
-    };
+    }
 
-    // Close the connection even when playing failed, then report the error (if any).
-    session.shutdown();
-    result
-}
+    let to_file = parse_args(&args)?;
 
-/// Where librespot keeps our login, volume and downloaded audio: `%APPDATA%\rusty-player\cache`.
-fn cache_dir() -> Result<PathBuf> {
-    let appdata = std::env::var_os("APPDATA").context("APPDATA is not set")?;
-    Ok(PathBuf::from(appdata).join("rusty-player").join("cache"))
-}
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+    let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
 
-/// Log in with the credentials saved in the cache by an earlier OAuth login.
-async fn connect() -> Result<Session> {
-    let dir = cache_dir()?;
-    let cache = Cache::new(Some(&dir), Some(&dir), Some(&dir.join("files")), None)
-        .with_context(|| format!("could not open the cache in {}", dir.display()))?;
+    let engine_handle = tokio::spawn(engine::run_engine(EngineConfig { to_file }, cmd_rx, evt_tx));
 
-    let credentials: Credentials = cache.credentials().with_context(|| {
-        format!(
-            "no saved login in {}. Log in once with OAuth:\n  cargo run -- --enable-oauth --cache \"{}\"",
-            dir.display(),
-            dir.display()
-        )
-    })?;
-
-    let session = Session::new(SessionConfig::default(), Some(cache));
-    // `true`: save the refreshed credentials back to the cache, so the next run logs in too.
-    session
-        .connect(credentials, true)
-        .await
-        .context("could not log in to Spotify")?;
-    Ok(session)
-}
-
-/// Play one track and return when it has ended, or when the user presses Ctrl+C.
-async fn play(session: &Session, track: SpotifyId, to_file: Option<PathBuf>) -> Result<()> {
-    // "pipe" writes raw PCM to the file given as its device; no device = the default (speakers).
-    let (backend_name, device) = match &to_file {
-        Some(path) => (Some("pipe".to_string()), Some(path.display().to_string())),
-        None => (None, None),
-    };
-    let backend = audio_backend::find(backend_name).context("audio backend not found")?;
-
-    let player = Player::new(
-        PlayerConfig::default(),
-        session.clone(),
-        Box::new(NoOpVolume),
-        move || backend(device, AudioFormat::default()),
+    println!(
+        "Commands: <track id or link> = play, p = pause, r = resume, s = stop, v <0-100> = volume, q = quit"
     );
 
-    player.load(SpotifyUri::Track { id: track }, true, 0);
-    match &to_file {
-        Some(path) => info!("Writing track to {}...", path.display()),
-        None => info!("Playing... (Ctrl+C to stop)"),
-    }
+    std::thread::spawn(move || {
+        for line_result in std::io::stdin().lines() {
+            match line_result {
+                Ok(line) => match parse_line(&line) {
+                    Ok(Some(cmd)) => {
+                        let is_quit = cmd == Command::Quit;
+                        if cmd_tx.send(cmd).is_err() {
+                            return;
+                        }
+                        if is_quit {
+                            return;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(message) => eprintln!("{message}"),
+                },
+                Err(error) => {
+                    eprintln!("Error: could not read input ({error}), quitting");
+                    let _ = cmd_tx.send(Command::Quit);
+                    return;
+                }
+            }
+        }
+        let _ = cmd_tx.send(Command::Quit);
+    });
 
-    tokio::select! {
-        _ = player.await_end_of_track() => info!("Track ended."),
-        signal = tokio::signal::ctrl_c() => {
-            player.stop();
-            signal.context("could not listen for Ctrl+C")?;
-            info!("Stopped by Ctrl+C.");
+    while let Some(event) = evt_rx.recv().await {
+        match event {
+            Event::LoggedIn { username } => println!("Logged in as {username}"),
+            Event::Playing { track_id } => println!("Playing {track_id}"),
+            Event::Paused => println!("Paused"),
+            Event::Stopped => println!("Stopped"),
+            Event::EndOfTrack => println!("Track ended"),
+            Event::VolumeChanged(v) => println!("Volume {}%", volume_to_percent(v)),
+            Event::Error(msg) => eprintln!("Error: {msg}"),
         }
     }
+
+    engine_handle.await.context("engine task failed")?;
+
     Ok(())
-}
-
-/// Turn the command-line arguments (without the program name) into an [`Action`].
-fn parse_args(args: &[String]) -> Result<Action> {
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    match args.as_slice() {
-        [] => Ok(Action::Login),
-        ["play", track] => Ok(Action::Play {
-            track: parse_track(track)?,
-            to_file: None,
-        }),
-        ["play", track, "--to-file", path] => Ok(Action::Play {
-            track: parse_track(track)?,
-            to_file: Some(PathBuf::from(path)),
-        }),
-        _ => bail!("{USAGE}"),
-    }
-}
-
-/// Accept a bare track ID, `spotify:track:<id>`, or `https://open.spotify.com/track/<id>?si=...`.
-fn parse_track(input: &str) -> Result<SpotifyId> {
-    let input = input.trim();
-    // Drop the "?si=..." share tracking part first, so the "/track/" match only looks at the path.
-    let path = input.split(['?', '#']).next().unwrap_or(input);
-    let id = if let Some(rest) = input.strip_prefix("spotify:track:") {
-        rest
-    } else if let Some((_, rest)) = path.split_once("open.spotify.com/track/") {
-        rest.trim_end_matches('/')
-    } else {
-        input
-    };
-    SpotifyId::from_base62(id).with_context(|| format!("not a Spotify track ID or link: {input}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ID: &str = "4uLU6hMCjMI75M1A2tKUQC";
+    #[test]
+    fn test_parse_line() {
+        assert_eq!(parse_line(""), Ok(None));
+        assert_eq!(parse_line("  "), Ok(None));
+        assert_eq!(parse_line("p"), Ok(Some(Command::Pause)));
+        assert_eq!(parse_line("P"), Ok(Some(Command::Pause)));
+        assert_eq!(parse_line("r"), Ok(Some(Command::Resume)));
+        assert_eq!(parse_line("s"), Ok(Some(Command::Stop)));
+        assert_eq!(parse_line("q"), Ok(Some(Command::Quit)));
 
-    fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(ToString::to_string).collect()
+        assert_eq!(parse_line("v 50"), Ok(Some(Command::SetVolume(32767))));
+        assert_eq!(parse_line("v 0"), Ok(Some(Command::SetVolume(0))));
+        assert_eq!(parse_line("v 100"), Ok(Some(Command::SetVolume(65535))));
+
+        assert_eq!(
+            parse_line("v"),
+            Err("volume must be a number from 0 to 100".to_string())
+        );
+        assert_eq!(
+            parse_line("v abc"),
+            Err("volume must be a number from 0 to 100".to_string())
+        );
+        assert_eq!(
+            parse_line("v 101"),
+            Err("volume must be a number from 0 to 100".to_string())
+        );
+        assert_eq!(
+            parse_line("v -1"),
+            Err("volume must be a number from 0 to 100".to_string())
+        );
+
+        assert_eq!(
+            parse_line("https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT"),
+            Ok(Some(Command::Play(
+                "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT".to_string()
+            )))
+        );
+        // A track ID that happens to start with "v" is a track, not a volume command.
+        assert_eq!(
+            parse_line("vXyz123abcDEF456ghiJKL"),
+            Ok(Some(Command::Play("vXyz123abcDEF456ghiJKL".to_string())))
+        );
+        assert_eq!(parse_line("V 30"), Ok(Some(Command::SetVolume(19660))));
+        assert_eq!(
+            parse_line(" spotify:track:x "),
+            Ok(Some(Command::Play("spotify:track:x".to_string())))
+        );
     }
 
     #[test]
-    fn parse_track_accepts_id_uri_and_link() {
-        let expected = SpotifyId::from_base62(ID).unwrap();
-        assert_eq!(parse_track(ID).unwrap(), expected);
-        assert_eq!(
-            parse_track(&format!("spotify:track:{ID}")).unwrap(),
-            expected
-        );
-        assert_eq!(
-            parse_track(&format!("https://open.spotify.com/track/{ID}?si=abc123")).unwrap(),
-            expected
-        );
-        assert_eq!(
-            parse_track(&format!("  https://open.spotify.com/track/{ID}/  ")).unwrap(),
-            expected
-        );
+    fn test_volume_conversions() {
+        assert_eq!(percent_to_volume(0), 0);
+        assert_eq!(percent_to_volume(50), 32767);
+        assert_eq!(percent_to_volume(100), 65535);
+
+        assert_eq!(volume_to_percent(0), 0);
+        assert_eq!(volume_to_percent(32767), 50);
+        assert_eq!(volume_to_percent(65535), 100);
     }
 
     #[test]
-    fn parse_track_rejects_garbage() {
-        assert!(parse_track("").is_err());
-        assert!(parse_track("not an id!").is_err());
-        assert!(parse_track("https://open.spotify.com/track/").is_err());
-        // "/track/" hidden in the query part is not a track link.
-        assert!(
-            parse_track(&format!(
-                "https://open.spotify.com/?si=open.spotify.com/track/{ID}"
-            ))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn no_arguments_only_logs_in() {
-        assert_eq!(parse_args(&[]).unwrap(), Action::Login);
-    }
-
-    #[test]
-    fn play_needs_a_track_and_to_file_needs_a_path() {
-        let track = SpotifyId::from_base62(ID).unwrap();
+    fn test_parse_args() {
+        assert_eq!(parse_args(&[]).unwrap(), None);
         assert_eq!(
-            parse_args(&args(&["play", ID])).unwrap(),
-            Action::Play {
-                track,
-                to_file: None
-            }
+            parse_args(&["--to-file".to_string(), "a.pcm".to_string()]).unwrap(),
+            Some(PathBuf::from("a.pcm"))
         );
-        assert_eq!(
-            parse_args(&args(&["play", ID, "--to-file", "out.pcm"])).unwrap(),
-            Action::Play {
-                track,
-                to_file: Some(PathBuf::from("out.pcm"))
-            }
-        );
-        assert!(parse_args(&args(&["play"])).is_err());
-        assert!(parse_args(&args(&["play", ID, "--to-file"])).is_err());
-        assert!(parse_args(&args(&[ID])).is_err());
+        assert!(parse_args(&["--to-file".to_string()]).is_err());
+        assert!(parse_args(&["x".to_string()]).is_err());
     }
 }

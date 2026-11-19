@@ -2,6 +2,24 @@
 
 What happened on rusty-player, newest first. Short entries: what was done, what went wrong, what was learned.
 
+## 2026-11-19: Phase 2, the engine with commands and events
+
+- Split the app into parts: `login.rs` (cached login), `track.rs` (reading a track ID or link), `engine.rs`
+  (owns the Spotify session, player and volume mixer) and `main.rs` (the terminal controller).
+- The engine runs as a Tokio task. The terminal sends it `Command`s (Play, Pause, Resume, Stop, SetVolume, Quit)
+  over one channel and gets `Event`s back (LoggedIn, Playing, Paused, Stopped, EndOfTrack, VolumeChanged, Error)
+  over another. Phase 3's window will use the same two channels.
+- Typing in the terminal: paste a track = play, `p` pause, `r` resume, `s` stop, `v 0-100` volume, `q` quit.
+  Nothing plays until you paste a track.
+- Who built what: the Lead wrote `login.rs`, `track.rs` and the engine's types; builderplus (GPT-6.1 Sol on Codex)
+  wrote the engine (1 fix round); builder (Gemini 3.8 Flash Low on agy) wrote the terminal loop.
+- Lead fixes after review: a pasted track ID starting with "v" was read as a volume command; a stdin read error
+  now says why it quits (found by rust-reviewer, GPT-6 Astra).
+- Tested silently (`--to-file`): bad ID and `v 150` rejected with clear messages, volume 40%, play, pause,
+  resume, stop, quit, all in order; quitting by closing the input also exits cleanly.
+- For Phase 3: quitting while the login is still running waits until the login ends. Fine in a terminal
+  (login takes under a second), but closing the window during login must not hang.
+
 ## 2026-11-19: Phase 1, log in and play one track (CLI)
 
 - `rusty-player` with no arguments only logs in with the cached credentials and prints the account. It never plays.

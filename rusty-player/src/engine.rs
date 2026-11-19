@@ -99,6 +99,8 @@ pub enum Event {
     TrackInfo(TrackInfo),
     Stopped,
     EndOfTrack,
+    /// Spotify would not give this track (for example the audio key was refused).
+    Unavailable(String),
     VolumeChanged(u16),
     /// Answer to `Command::LoadPlaylists`.
     PlaylistsLoaded(Vec<PlaylistSummary>),
@@ -567,10 +569,9 @@ fn map_player_event(ev: &PlayerEvent) -> Option<Event> {
         PlayerEvent::TrackChanged { audio_item } => Some(Event::TrackInfo(track_info(audio_item))),
         PlayerEvent::Stopped { .. } => Some(Event::Stopped),
         PlayerEvent::EndOfTrack { .. } => Some(Event::EndOfTrack),
-        PlayerEvent::Unavailable { track_id, .. } => Some(Event::Error(format!(
-            "track unavailable: {}",
-            player_track_uri(track_id)
-        ))),
+        PlayerEvent::Unavailable { track_id, .. } => {
+            Some(Event::Unavailable(player_track_uri(track_id)))
+        }
         _ => None,
     }
 }
@@ -677,8 +678,8 @@ mod tests {
         });
         assert_eq!(
             event,
-            Some(Event::Error(
-                "track unavailable: spotify:track:4uLU6hMCjMI75M1A2tKUQC".into()
+            Some(Event::Unavailable(
+                "spotify:track:4uLU6hMCjMI75M1A2tKUQC".into()
             ))
         );
     }

@@ -4,7 +4,7 @@
 use std::{
     path::PathBuf,
     sync::{Arc, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -51,6 +51,11 @@ fn load_fonts(ctx: &egui::Context) {
     }
     ctx.set_fonts(fonts);
 }
+
+/// A track that ends or fails sooner than this after Play counts as a failed track.
+const QUICK_FAIL: Duration = Duration::from_secs(10);
+/// Auto-advance stops after this many failed tracks in a row.
+const MAX_QUICK_FAILS: u8 = 3;
 
 fn apply_theme(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
@@ -507,6 +512,10 @@ pub struct PlayerApp {
     settings_open: bool,
     settings_saved: bool,
     current_uri: Option<String>,
+    /// When the last Play command was sent: a track that ends or fails sooner than `QUICK_FAIL` counts as failed.
+    play_started: Option<Instant>,
+    /// Tracks in a row that failed quickly; auto-advance stops at `MAX_QUICK_FAILS`.
+    quick_failures: u8,
     #[cfg(windows)]
     media_controls: Option<souvlaki::MediaControls>,
     #[cfg(windows)]
@@ -555,6 +564,8 @@ impl PlayerApp {
             settings_open: false,
             settings_saved: false,
             current_uri: None,
+            play_started: None,
+            quick_failures: 0,
             #[cfg(windows)]
             media_controls: None,
             #[cfg(windows)]
@@ -624,18 +635,10 @@ impl PlayerApp {
                 self.status = Status::Stopped;
                 self.progress = None;
             }
-            Event::EndOfTrack => {
-                self.progress = None;
-                if let Some(queue) = self.queue.as_mut() {
-                    if let Some(track) = queue.advance() {
-                        let uri = track.uri.clone();
-                        self.send(Command::Play(uri));
-                    } else {
-                        self.status = Status::Ended;
-                    }
-                } else {
-                    self.status = Status::Ended;
-                }
+            Event::EndOfTrack => self.auto_advance(now),
+            Event::Unavailable(uri) => {
+                self.last_error = Some(format!("Spotify would not play this song: {uri}"));
+                self.auto_advance(now);
             }
             Event::VolumeChanged(v) => {
                 let percent = volume_to_percent(v).min(100) as u8;
@@ -708,7 +711,37 @@ impl PlayerApp {
         }
     }
 
+    /// The current track ended or failed: play the next one in the queue, unless several tracks in a row
+    /// failed right away (Spotify refusing audio keys): then stop, so we don't hammer Spotify with requests.
+    fn auto_advance(&mut self, now: Instant) {
+        self.progress = None;
+        let quick = self
+            .play_started
+            .is_some_and(|started| now.saturating_duration_since(started) < QUICK_FAIL);
+        self.quick_failures = if quick { self.quick_failures + 1 } else { 0 };
+        if self.quick_failures >= MAX_QUICK_FAILS {
+            self.quick_failures = 0;
+            self.status = Status::Ended;
+            self.last_error = Some(format!(
+                "{MAX_QUICK_FAILS} songs in a row failed to play (Spotify refused them). Wait a few minutes, then press play again."
+            ));
+            return;
+        }
+        let next = self
+            .queue
+            .as_mut()
+            .and_then(|queue| queue.advance())
+            .map(|track| track.uri.clone());
+        match next {
+            Some(uri) => self.send(Command::Play(uri)),
+            None => self.status = Status::Ended,
+        }
+    }
+
     fn send(&mut self, command: Command) {
+        if matches!(command, Command::Play(_)) {
+            self.play_started = Some(Instant::now());
+        }
         if self.cmd_tx.send(command).is_err() {
             self.last_error = Some("the engine has stopped".into());
         }
@@ -718,6 +751,7 @@ impl PlayerApp {
         if tracks.is_empty() {
             return;
         }
+        self.quick_failures = 0;
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -749,6 +783,7 @@ impl PlayerApp {
     }
 
     fn next(&mut self) {
+        self.quick_failures = 0;
         if let Some(queue) = self.queue.as_mut() {
             if let Some(track) = queue.advance() {
                 let uri = track.uri.clone();
@@ -762,6 +797,7 @@ impl PlayerApp {
     }
 
     fn previous(&mut self, now: Instant) {
+        self.quick_failures = 0;
         if self.can_restart(now) {
             if let Some(uri) = self.current_uri.clone() {
                 self.send(Command::Play(uri));
@@ -1286,6 +1322,7 @@ impl PlayerApp {
                     }
                 }
                 if let Some(idx) = queue_jump {
+                    self.quick_failures = 0;
                     if let Some(queue) = self.queue.as_mut() {
                         if let Some(track) = queue.jump_to(idx) {
                             let uri = track.uri.clone();
@@ -1490,6 +1527,58 @@ fn stats_track_entry(ui: &mut egui::Ui, track: &TrackSummary) -> bool {
     play_clicked || response.double_clicked()
 }
 
+/// Fixed x positions of the track list columns, shared by the header and every row so they line up.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TrackColumns {
+    hash: egui::Rangef,
+    title: egui::Rangef,
+    album: egui::Rangef,
+    duration: egui::Rangef,
+}
+
+impl TrackColumns {
+    fn new(x: egui::Rangef) -> Self {
+        const PAD: f32 = 8.0;
+        const GAP: f32 = 16.0;
+        const HASH_W: f32 = 40.0;
+        const DUR_W: f32 = 70.0;
+        let left = x.min + PAD;
+        let right = (x.max - PAD).max(left + HASH_W + DUR_W + 3.0 * GAP + 100.0);
+        let hash = egui::Rangef::new(left, left + HASH_W);
+        let duration = egui::Rangef::new(right - DUR_W, right);
+        let mid_start = hash.max + GAP;
+        let mid_end = duration.min - GAP;
+        let title_w = (mid_end - mid_start - GAP) * 0.6;
+        let title = egui::Rangef::new(mid_start, mid_start + title_w);
+        let album = egui::Rangef::new(title.max + GAP, mid_end);
+        Self {
+            hash,
+            title,
+            album,
+            duration,
+        }
+    }
+}
+
+/// Draw one cell of a row: a child ui clipped to the column, centered vertically.
+fn column_cell(
+    ui: &mut egui::Ui,
+    x: egui::Rangef,
+    row: egui::Rect,
+    align: egui::Align,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    let rect = egui::Rect::from_x_y_ranges(x, row.y_range());
+    let layout = match align {
+        egui::Align::Max => egui::Layout::right_to_left(egui::Align::Center),
+        egui::Align::Center => egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+        egui::Align::Min => egui::Layout::left_to_right(egui::Align::Center),
+    };
+    let mut cell = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+    cell.set_clip_rect(rect.intersect(ui.clip_rect()));
+    add(&mut cell);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrackAction {
     Play(usize),
@@ -1504,33 +1593,21 @@ fn track_list(
     loading: bool,
     paging_failed: bool,
 ) -> (Option<TrackAction>, usize, bool) {
-    let available_w = ui.available_width();
-    let col_hash_w = 40.0;
-    let col_dur_w = 70.0;
-    let col_spacing = 16.0;
-    let rem_w = (available_w - col_hash_w - col_dur_w - col_spacing * 3.0).max(100.0);
-    let col_title_w = rem_w * 0.60;
-    let col_album_w = rem_w * 0.40;
-
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            [col_hash_w, 20.0],
-            egui::Label::new(egui::RichText::new("#").weak()),
-        );
-        ui.add_sized(
-            [col_title_w, 20.0],
-            egui::Label::new(egui::RichText::new("Title").weak()),
-        );
-        ui.add_sized(
-            [col_album_w, 20.0],
-            egui::Label::new(egui::RichText::new("Album").weak()),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_sized(
-                [col_dur_w, 20.0],
-                egui::Label::new(egui::RichText::new("Duration").weak()),
-            );
-        });
+    let (head_rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::hover());
+    let head_cols = TrackColumns::new(head_rect.x_range());
+    let weak = |text: &str| egui::Label::new(egui::RichText::new(text).weak());
+    column_cell(ui, head_cols.hash, head_rect, egui::Align::Center, |ui| {
+        ui.add(weak("#"));
+    });
+    column_cell(ui, head_cols.title, head_rect, egui::Align::Min, |ui| {
+        ui.add(weak("Title"));
+    });
+    column_cell(ui, head_cols.album, head_rect, egui::Align::Min, |ui| {
+        ui.add(weak("Album"));
+    });
+    column_cell(ui, head_cols.duration, head_rect, egui::Align::Max, |ui| {
+        ui.add(weak("Duration"));
     });
     ui.separator();
 
@@ -1575,56 +1652,40 @@ fn track_list(
                         action = Some(TrackAction::Play(idx));
                     }
 
-                    let mut row_ui = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(row_rect.shrink2(egui::vec2(8.0, 4.0)))
-                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                    );
-
+                    let cols = TrackColumns::new(row_rect.x_range());
                     let icon_opt = row_icon(is_hovered, is_current, status_is_playing);
-                    row_ui.allocate_ui_with_layout(
-                        egui::vec2(col_hash_w, 48.0),
-                        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                        |ui| {
-                            if let Some(icon) = icon_opt {
-                                let btn_resp = icon_button(ui, icon, 20.0, false);
-                                if btn_resp.clicked() {
-                                    if is_current {
-                                        action = Some(TrackAction::Toggle);
-                                    } else {
-                                        action = Some(TrackAction::Play(idx));
-                                    }
-                                }
-                            } else {
-                                let mut num_text =
-                                    egui::RichText::new((idx + 1).to_string()).weak();
-                                if is_current {
-                                    num_text = num_text.color(GREEN);
-                                }
-                                ui.add(egui::Label::new(num_text));
+                    column_cell(ui, cols.hash, row_rect, egui::Align::Center, |ui| {
+                        if let Some(icon) = icon_opt {
+                            if icon_button(ui, icon, 20.0, false).clicked() {
+                                action = Some(if is_current {
+                                    TrackAction::Toggle
+                                } else {
+                                    TrackAction::Play(idx)
+                                });
                             }
-                        },
-                    );
+                        } else {
+                            let mut num_text = egui::RichText::new((idx + 1).to_string()).weak();
+                            if is_current {
+                                num_text = num_text.color(GREEN);
+                            }
+                            ui.add(egui::Label::new(num_text));
+                        }
+                    });
 
-                    if let Some(url) = &track.image_url {
-                        row_ui.add(
-                            egui::Image::new(url.as_str())
-                                .fit_to_exact_size(egui::vec2(40.0, 40.0))
-                                .corner_radius(4.0),
-                        );
-                    } else {
-                        let (t_rect, _) = row_ui
-                            .allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
-                        row_ui.painter().rect_filled(t_rect, 4.0, CARD);
-                    }
-                    row_ui.add_space(8.0);
-
-                    let title_actual_w = (col_title_w - 48.0).max(20.0);
-                    row_ui.allocate_ui_with_layout(
-                        egui::vec2(title_actual_w, 48.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            ui.add_space(4.0);
+                    column_cell(ui, cols.title, row_rect, egui::Align::Min, |ui| {
+                        if let Some(url) = &track.image_url {
+                            ui.add(
+                                egui::Image::new(url.as_str())
+                                    .fit_to_exact_size(egui::vec2(40.0, 40.0))
+                                    .corner_radius(4.0),
+                            );
+                        } else {
+                            let (t_rect, _) = ui
+                                .allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+                            ui.painter().rect_filled(t_rect, 4.0, CARD);
+                        }
+                        ui.add_space(8.0);
+                        ui.vertical(|ui| {
                             let title_text = if is_current {
                                 egui::RichText::new(&track.name).strong().color(GREEN)
                             } else {
@@ -1639,21 +1700,17 @@ fn track_list(
                                 )
                                 .truncate(),
                             );
-                        },
-                    );
+                        });
+                    });
 
-                    row_ui.allocate_ui_with_layout(
-                        egui::vec2(col_album_w, 48.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(&track.album).weak().small())
-                                    .truncate(),
-                            );
-                        },
-                    );
+                    column_cell(ui, cols.album, row_rect, egui::Align::Min, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&track.album).weak().small())
+                                .truncate(),
+                        );
+                    });
 
-                    row_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    column_cell(ui, cols.duration, row_rect, egui::Align::Max, |ui| {
                         ui.add(egui::Label::new(
                             egui::RichText::new(format_time(track.duration_ms))
                                 .weak()
@@ -2370,6 +2427,68 @@ impl eframe::App for PlayerApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_advance_stops_after_three_quick_failures() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = unbounded_channel::<Event>();
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
+        let tracks: Vec<TrackSummary> = (0..6)
+            .map(|i| TrackSummary {
+                uri: format!("spotify:track:t{i}"),
+                name: format!("t{i}"),
+                artists: String::new(),
+                album: String::new(),
+                duration_ms: 1000,
+                image_url: None,
+            })
+            .collect();
+        app.play_tracks(&tracks, 0, QueueSource::Search);
+        let t0 = Instant::now();
+        app.apply_event(Event::Unavailable("spotify:track:t0".into()), t0);
+        app.apply_event(Event::EndOfTrack, t0);
+        app.apply_event(Event::Unavailable("spotify:track:t2".into()), t0);
+        let mut plays = 0;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(cmd, Command::Play(_)) {
+                plays += 1;
+            }
+        }
+        // first play + 2 automatic skips, the third quick failure stops
+        assert_eq!(plays, 3);
+        assert_eq!(app.status, Status::Ended);
+        assert!(
+            app.last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("in a row"))
+        );
+    }
+
+    #[test]
+    fn auto_advance_continues_after_a_track_that_played() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = unbounded_channel::<Event>();
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
+        app.quick_failures = 2;
+        let now = Instant::now();
+        app.play_started = now.checked_sub(Duration::from_secs(60));
+        app.auto_advance(now);
+        assert_eq!(app.quick_failures, 0);
+        assert!(app.last_error.is_none());
+    }
+
+    #[test]
+    fn track_columns_line_up_and_do_not_overlap() {
+        let a = TrackColumns::new(egui::Rangef::new(0.0, 1000.0));
+        let b = TrackColumns::new(egui::Rangef::new(0.0, 1000.0));
+        assert_eq!(a, b);
+        assert!(a.hash.max < a.title.min);
+        assert!(a.title.max < a.album.min);
+        assert!(a.album.max < a.duration.min);
+        assert!((a.duration.max - 992.0).abs() < 0.01);
+        let tiny = TrackColumns::new(egui::Rangef::new(0.0, 50.0));
+        assert!(tiny.title.max < tiny.album.min && tiny.album.max < tiny.duration.min);
+    }
     use std::time::Duration;
 
     fn create_test_app() -> (UnboundedSender<Event>, PlayerApp) {

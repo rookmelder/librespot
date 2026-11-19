@@ -173,6 +173,7 @@ pub async fn run(to_file: Option<PathBuf>, settings: Settings) -> Result<()> {
                 }
             }
             Event::Error(msg) => eprintln!("Error: {msg}"),
+            Event::Unavailable(uri) => eprintln!("Error: track unavailable: {uri}"),
         }
     }
 

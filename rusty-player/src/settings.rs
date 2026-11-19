@@ -13,6 +13,7 @@ pub struct Settings {
     pub bitrate: u16,
     pub normalisation: bool,
     pub volume_percent: u8,
+    pub shuffle: bool,
 }
 
 impl Default for Settings {
@@ -21,6 +22,7 @@ impl Default for Settings {
             bitrate: 320,
             normalisation: false,
             volume_percent: 100,
+            shuffle: false,
         }
     }
 }
@@ -100,6 +102,7 @@ mod tests {
                 bitrate: 320,
                 normalisation: false,
                 volume_percent: 100,
+                shuffle: false,
             }
         );
         assert_eq!(parse(""), Settings::default());
@@ -111,6 +114,7 @@ mod tests {
             bitrate: 160,
             normalisation: true,
             volume_percent: 42,
+            shuffle: true,
         };
         let text = toml::to_string(&settings).unwrap();
         assert_eq!(parse(&text), settings);
@@ -122,6 +126,20 @@ mod tests {
         for value in [96, 160, 320] {
             assert_eq!(parse(&format!("bitrate = {value}")).bitrate, value);
         }
+    }
+
+    #[test]
+    fn old_toml_defaults_shuffle_to_false() {
+        let settings = parse("bitrate = 160\nnormalisation = true\nvolume_percent = 42\n");
+        assert_eq!(
+            settings,
+            Settings {
+                bitrate: 160,
+                normalisation: true,
+                volume_percent: 42,
+                shuffle: false,
+            }
+        );
     }
 
     #[test]

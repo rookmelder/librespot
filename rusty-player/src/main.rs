@@ -6,6 +6,7 @@
 mod cli;
 mod engine;
 mod login;
+mod queue;
 mod settings;
 mod track;
 mod ui;

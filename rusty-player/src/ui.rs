@@ -15,6 +15,7 @@ use tokio::sync::mpsc::{
 
 use crate::cli::{percent_to_volume, volume_to_percent};
 use crate::engine::{self, Command, EngineConfig, Event, EventSender, TrackInfo};
+use crate::queue::{Queue, QueueSource};
 use crate::settings::Settings;
 use crate::webapi::{PlaylistSummary, Stats, TrackSummary};
 
@@ -197,20 +198,6 @@ fn track_row_label(n: usize, t: &TrackSummary) -> String {
 #[cfg(test)]
 fn playlist_label(p: &PlaylistSummary) -> String {
     format!("{} ({})", p.name, p.track_count)
-}
-
-pub fn next_in_queue(queue: &[String], pos: Option<usize>) -> Option<usize> {
-    match pos {
-        Some(i) if i + 1 < queue.len() => Some(i + 1),
-        _ => None,
-    }
-}
-
-pub fn prev_in_queue(queue: &[String], pos: Option<usize>) -> Option<usize> {
-    match pos {
-        Some(i) if i > 0 && i < queue.len() => Some(i - 1),
-        _ => None,
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -443,6 +430,57 @@ fn draw_volume_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Colo
     painter.line_segment([wave_mid, wave_bot], egui::Stroke::new(1.5_f32, color));
 }
 
+fn draw_shuffle_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let stroke = egui::Stroke::new(1.8_f32, color);
+    let x0 = c.x - 7.0;
+    let x1 = c.x + 7.0;
+    let y0 = c.y - 5.0;
+    let y1 = c.y + 5.0;
+
+    painter.line_segment([egui::pos2(x0, y0), egui::pos2(x1, y1)], stroke);
+    painter.line_segment([egui::pos2(x0, y1), egui::pos2(x1, y0)], stroke);
+
+    painter.line_segment([egui::pos2(x1 - 4.0, y0), egui::pos2(x1, y0)], stroke);
+    painter.line_segment([egui::pos2(x1, y0 + 4.0), egui::pos2(x1, y0)], stroke);
+
+    painter.line_segment([egui::pos2(x1 - 4.0, y1), egui::pos2(x1, y1)], stroke);
+    painter.line_segment([egui::pos2(x1, y1 - 4.0), egui::pos2(x1, y1)], stroke);
+}
+
+fn draw_queue_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let left = c.x - 7.0;
+    let right = c.x + 7.0;
+    let stroke = egui::Stroke::new(1.8_f32, color);
+    for y_off in [-5.0, 0.0, 5.0] {
+        painter.line_segment(
+            [
+                egui::pos2(left, c.y + y_off),
+                egui::pos2(right, c.y + y_off),
+            ],
+            stroke,
+        );
+    }
+}
+
+fn draw_now_playing_bars(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let bar_w = 2.0;
+    let gap = 2.0;
+    let heights = [6.0, 14.0, 10.0];
+    let total_w = 3.0 * bar_w + 2.0 * gap;
+    let start_x = rect.center().x - total_w / 2.0;
+    let bot_y = rect.center().y + 7.0;
+    for (i, &h) in heights.iter().enumerate() {
+        let x = start_x + i as f32 * (bar_w + gap);
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(x, bot_y - h), egui::vec2(bar_w, h)),
+            1.0,
+            color,
+        );
+    }
+}
+
 pub struct PlayerApp {
     cmd_tx: UnboundedSender<Command>,
     evt_rx: UnboundedReceiver<Event>,
@@ -479,8 +517,9 @@ pub struct PlayerApp {
     search_loading: bool,
     search_query: Option<String>,
     search_results: Vec<TrackSummary>,
-    queue: Vec<String>,
-    queue_pos: Option<usize>,
+    queue: Option<Queue>,
+    queue_open: bool,
+    queue_scroll_to_current: bool,
     view: View,
 }
 
@@ -526,8 +565,9 @@ impl PlayerApp {
             search_loading: false,
             search_query: None,
             search_results: Vec::new(),
-            queue: Vec::new(),
-            queue_pos: None,
+            queue: None,
+            queue_open: false,
+            queue_scroll_to_current: false,
             view: View::Playlist,
         }
     }
@@ -539,8 +579,6 @@ impl PlayerApp {
             Event::LoggedIn { username } => {
                 self.username = Some(username);
                 self.status = Status::Idle;
-                // Load the library right away, but only when that cannot open a browser (Web API
-                // login done before). Otherwise the user clicks "Load playlists" the first time.
                 if self.playlists.is_empty()
                     && !self.playlists_loading
                     && crate::webapi::has_saved_token()
@@ -586,10 +624,13 @@ impl PlayerApp {
             }
             Event::EndOfTrack => {
                 self.progress = None;
-                if let Some(next_idx) = next_in_queue(&self.queue, self.queue_pos) {
-                    self.queue_pos = Some(next_idx);
-                    let uri = self.queue[next_idx].clone();
-                    self.send(Command::Play(uri));
+                if let Some(queue) = self.queue.as_mut() {
+                    if let Some(track) = queue.advance() {
+                        let uri = track.uri.clone();
+                        self.send(Command::Play(uri));
+                    } else {
+                        self.status = Status::Ended;
+                    }
                 } else {
                     self.status = Status::Ended;
                 }
@@ -617,10 +658,19 @@ impl PlayerApp {
                 if page.offset as usize == self.liked.len() {
                     if page.tracks.is_empty() {
                         self.liked_total = Some(self.liked.len() as u32);
+                    } else {
+                        if let Some(queue) = self.queue.as_mut() {
+                            if queue.source() == &QueueSource::Liked {
+                                queue.append(page.tracks.clone());
+                            }
+                        }
+                        self.liked.extend(page.tracks);
                     }
-                    self.liked.extend(page.tracks);
                 }
                 self.liked_loading = false;
+                if self.should_background_load_liked() {
+                    self.load_liked();
+                }
             }
             Event::SettingsSaved => self.settings_saved = true,
             Event::StatsLoaded(stats) => {
@@ -662,18 +712,46 @@ impl PlayerApp {
         }
     }
 
-    fn play_queue(&mut self, queue: Vec<String>, index: usize) {
-        self.queue = queue;
-        self.queue_pos = Some(index);
-        if let Some(uri) = self.queue.get(index).cloned() {
+    fn play_tracks(&mut self, tracks: &[TrackSummary], index: usize, source: QueueSource) {
+        if tracks.is_empty() {
+            return;
+        }
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1);
+        let mut q = Queue::new(tracks.to_vec(), index, source, seed);
+        if self.settings.shuffle {
+            q.set_shuffle(true);
+        }
+        if let Some(track) = q.current() {
+            let uri = track.uri.clone();
             self.send(Command::Play(uri));
+        }
+        self.queue = Some(q);
+        if self.should_background_load_liked() {
+            self.load_liked();
+        }
+    }
+
+    pub fn toggle_shuffle(&mut self) {
+        self.settings.shuffle = !self.settings.shuffle;
+        if let Some(queue) = self.queue.as_mut() {
+            queue.set_shuffle(self.settings.shuffle);
+        }
+        self.settings_saved = false;
+        self.send(Command::SaveSettings(self.settings.clone()));
+        if self.should_background_load_liked() {
+            self.load_liked();
         }
     }
 
     fn next(&mut self) {
-        if let Some(index) = next_in_queue(&self.queue, self.queue_pos) {
-            self.queue_pos = Some(index);
-            self.send(Command::Play(self.queue[index].clone()));
+        if let Some(queue) = self.queue.as_mut() {
+            if let Some(track) = queue.advance() {
+                let uri = track.uri.clone();
+                self.send(Command::Play(uri));
+            }
         }
     }
 
@@ -686,9 +764,11 @@ impl PlayerApp {
             if let Some(uri) = self.current_uri.clone() {
                 self.send(Command::Play(uri));
             }
-        } else if let Some(index) = prev_in_queue(&self.queue, self.queue_pos) {
-            self.queue_pos = Some(index);
-            self.send(Command::Play(self.queue[index].clone()));
+        } else if let Some(queue) = self.queue.as_mut() {
+            if let Some(track) = queue.back() {
+                let uri = track.uri.clone();
+                self.send(Command::Play(uri));
+            }
         }
     }
 
@@ -720,6 +800,21 @@ impl PlayerApp {
                 .liked_total
                 .is_some_and(|total| self.liked.len() < total as usize)
             && visible_end.saturating_add(10) >= self.liked.len()
+    }
+
+    fn should_background_load_liked(&self) -> bool {
+        let queue_is_liked = self
+            .queue
+            .as_ref()
+            .is_some_and(|q| q.source() == &QueueSource::Liked);
+        queue_is_liked
+            && self.settings.shuffle
+            && self.username.is_some()
+            && !self.liked_loading
+            && !self.liked_paging_failed
+            && self
+                .liked_total
+                .is_some_and(|total| self.liked.len() < total as usize)
     }
 
     fn library_panel(&mut self, ctx: &egui::Context) {
@@ -817,9 +912,15 @@ impl PlayerApp {
     fn play_input(&mut self) {
         let text = self.track_input.trim().to_string();
         if !text.is_empty() {
-            self.queue.clear();
-            self.queue_pos = None;
-            self.send(Command::Play(text));
+            let track = TrackSummary {
+                uri: text.clone(),
+                name: text.clone(),
+                artists: String::new(),
+                album: String::new(),
+                duration_ms: 0,
+                image_url: None,
+            };
+            self.play_tracks(&[track], 0, QueueSource::Link);
         }
     }
 
@@ -974,6 +1075,287 @@ impl PlayerApp {
             self.media_rx = None;
         }
     }
+
+    fn queue_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("queue")
+            .resizable(true)
+            .default_width(280.0)
+            .frame(side_frame())
+            .show(ctx, |ui| {
+                ui.heading("Queue");
+                let Some(queue) = self.queue.as_ref() else {
+                    ui.weak("No queue");
+                    return;
+                };
+
+                let source_str = match queue.source() {
+                    QueueSource::Playlist(name) => name.clone(),
+                    QueueSource::Liked => "Liked Songs".to_string(),
+                    QueueSource::Search => "Search".to_string(),
+                    QueueSource::Stats => "Stats".to_string(),
+                    QueueSource::Link => "Link".to_string(),
+                };
+                ui.weak(format!("Playing from: {source_str}"));
+                ui.add_space(8.0);
+
+                let current_pos = queue.pos();
+                let mut queue_move = None;
+                let mut queue_jump = None;
+                let mut scrolled_to_current = false;
+
+                let row_height = 48.0;
+                let total_rows = queue.len();
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_height, total_rows, |ui, rows| {
+                        for idx in rows {
+                            let Some(entry) = queue.entries().get(idx) else {
+                                continue;
+                            };
+                            let is_past = current_pos.is_some_and(|pos| idx < pos);
+                            let is_current = current_pos == Some(idx);
+                            let is_next_up = current_pos.is_some_and(|pos| idx == pos + 1);
+
+                            if is_current {
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new("Now playing").weak().small());
+                            } else if is_next_up {
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new("Next up").weak().small());
+                            }
+
+                            let id = egui::Id::new("queue_row").with(entry.id);
+                            let drag_resp = ui
+                                .dnd_drag_source(id, idx, |ui| {
+                                    let available_w = ui.available_width();
+                                    let (row_rect, row_resp) = ui.allocate_exact_size(
+                                        egui::vec2(available_w, row_height),
+                                        egui::Sense::hover(),
+                                    );
+                                    let is_hovered = row_resp.hovered();
+                                    let bg_color = if is_current {
+                                        CARD
+                                    } else if is_hovered {
+                                        HOVER
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    };
+                                    ui.painter().rect_filled(row_rect, 4.0, bg_color);
+
+                                    let mut row_ui = ui.new_child(
+                                        egui::UiBuilder::new()
+                                            .max_rect(row_rect.shrink2(egui::vec2(4.0, 4.0)))
+                                            .layout(egui::Layout::left_to_right(
+                                                egui::Align::Center,
+                                            )),
+                                    );
+
+                                    let thumb_size = egui::vec2(40.0, 40.0);
+                                    if let Some(url) = &entry.track.image_url {
+                                        let mut img = egui::Image::new(url.as_str())
+                                            .fit_to_exact_size(thumb_size)
+                                            .corner_radius(4.0);
+                                        if is_past {
+                                            img = img.tint(egui::Color32::from_white_alpha(128));
+                                        }
+                                        row_ui.add(img);
+                                    } else {
+                                        let (t_rect, _) = row_ui
+                                            .allocate_exact_size(thumb_size, egui::Sense::hover());
+                                        let fill = if is_past {
+                                            egui::Color32::from_rgb(20, 20, 20)
+                                        } else {
+                                            CARD
+                                        };
+                                        row_ui.painter().rect_filled(t_rect, 4.0, fill);
+                                    }
+
+                                    row_ui.add_space(6.0);
+
+                                    if is_current {
+                                        row_ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let (bars_rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(16.0, 16.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                draw_now_playing_bars(
+                                                    ui.painter(),
+                                                    bars_rect,
+                                                    GREEN,
+                                                );
+                                            },
+                                        );
+                                    }
+
+                                    let text_w = row_ui.available_width();
+                                    row_ui.allocate_ui_with_layout(
+                                        egui::vec2(text_w, 40.0),
+                                        egui::Layout::top_down(egui::Align::Min),
+                                        |ui| {
+                                            ui.add_space(2.0);
+                                            let title_color = if is_current {
+                                                GREEN
+                                            } else if is_past {
+                                                egui::Color32::from_rgb(140, 140, 140)
+                                            } else {
+                                                egui::Color32::WHITE
+                                            };
+                                            let mut title_rt =
+                                                egui::RichText::new(&entry.track.name)
+                                                    .size(13.0)
+                                                    .color(title_color);
+                                            if !is_past {
+                                                title_rt = title_rt.strong();
+                                            } else {
+                                                title_rt = title_rt.weak();
+                                            }
+                                            ui.add(egui::Label::new(title_rt).truncate());
+
+                                            let mut artist_rt =
+                                                egui::RichText::new(&entry.track.artists).small();
+                                            if is_past {
+                                                artist_rt = artist_rt
+                                                    .color(egui::Color32::from_rgb(110, 110, 110));
+                                            } else {
+                                                artist_rt = artist_rt.weak();
+                                            }
+                                            ui.add(egui::Label::new(artist_rt).truncate());
+                                        },
+                                    );
+                                })
+                                .response;
+
+                            let response = ui.interact(
+                                drag_resp.rect,
+                                drag_resp.id,
+                                egui::Sense::click_and_drag(),
+                            );
+
+                            if is_current && self.queue_scroll_to_current {
+                                response.scroll_to_me(Some(egui::Align::Center));
+                                scrolled_to_current = true;
+                            }
+
+                            if let Some(from) = response.dnd_release_payload::<usize>() {
+                                queue_move = Some((*from, idx));
+                            }
+                            if let Some(from) = response.dnd_hover_payload::<usize>() {
+                                let y = if *from <= idx {
+                                    response.rect.bottom()
+                                } else {
+                                    response.rect.top()
+                                };
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(response.rect.left(), y),
+                                        egui::pos2(response.rect.right(), y),
+                                    ],
+                                    egui::Stroke::new(2.0_f32, GREEN),
+                                );
+                            }
+                            if response.double_clicked() {
+                                queue_jump = Some(idx);
+                            }
+                        }
+                    });
+
+                if self.queue_scroll_to_current {
+                    if !scrolled_to_current {
+                        if let Some(pos) = current_pos {
+                            let approx_y = pos as f32 * row_height;
+                            ui.scroll_to_rect(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(ui.min_rect().min.x, approx_y),
+                                    egui::vec2(10.0, row_height),
+                                ),
+                                Some(egui::Align::Center),
+                            );
+                        }
+                    }
+                    self.queue_scroll_to_current = false;
+                }
+
+                if let Some((from, to)) = queue_move {
+                    if let Some(queue) = self.queue.as_mut() {
+                        queue.move_entry(from, to);
+                    }
+                }
+                if let Some(idx) = queue_jump {
+                    if let Some(queue) = self.queue.as_mut() {
+                        if let Some(track) = queue.jump_to(idx) {
+                            let uri = track.uri.clone();
+                            self.send(Command::Play(uri));
+                        }
+                    }
+                }
+            });
+    }
+
+    fn stats_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("stats")
+            .resizable(true)
+            .default_width(240.0)
+            .frame(side_frame())
+            .show(ctx, |ui| {
+                ui.heading("Stats");
+
+                let button_text = if self.stats.is_none() {
+                    "Load stats"
+                } else {
+                    "Reload"
+                };
+                let can_load = !self.stats_loading && self.username.is_some();
+                if ui
+                    .add_enabled(can_load, egui::Button::new(button_text))
+                    .clicked()
+                {
+                    self.stats_loading = true;
+                    self.send(Command::LoadStats);
+                }
+
+                if self.stats_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading stats...");
+                    });
+                }
+
+                let mut clicked_stats_track = None;
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if let Some(stats) = &self.stats {
+                        ui.collapsing("Recently played", |ui| {
+                            for (idx, track) in stats.recently_played.iter().enumerate() {
+                                if stats_track_entry(ui, track) && self.username.is_some() {
+                                    clicked_stats_track =
+                                        Some((stats.recently_played.clone(), idx));
+                                }
+                            }
+                        });
+
+                        ui.collapsing("Top tracks", |ui| {
+                            for (idx, track) in stats.top_tracks.iter().enumerate() {
+                                if stats_track_entry(ui, track) && self.username.is_some() {
+                                    clicked_stats_track = Some((stats.top_tracks.clone(), idx));
+                                }
+                            }
+                        });
+
+                        ui.collapsing("Top artists", |ui| {
+                            for (idx, artist) in stats.top_artists.iter().enumerate() {
+                                ui.label(format!("{}. {artist}", idx + 1));
+                            }
+                        });
+                    }
+                });
+
+                if let Some((tracks, idx)) = clicked_stats_track {
+                    self.play_tracks(&tracks, idx, QueueSource::Stats);
+                }
+            });
+    }
 }
 
 fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
@@ -1104,10 +1486,6 @@ fn stats_track_entry(ui: &mut egui::Ui, track: &TrackSummary) -> bool {
     );
 
     play_clicked || response.double_clicked()
-}
-
-fn queue_uris(tracks: &[TrackSummary]) -> Vec<String> {
-    tracks.iter().map(|track| track.uri.clone()).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1288,7 +1666,7 @@ fn track_list(
 }
 
 enum HeaderAction {
-    PlayQueue(Vec<String>),
+    Play,
     Toggle,
 }
 
@@ -1370,7 +1748,8 @@ fn render_header(
 fn render_header_actions(
     ui: &mut egui::Ui,
     tracks: &[TrackSummary],
-    queue: &[String],
+    source: &QueueSource,
+    queue: Option<&Queue>,
     status: &Status,
     current_uri: Option<&str>,
     has_user: bool,
@@ -1378,8 +1757,8 @@ fn render_header_actions(
     ui.add_space(8.0);
     let mut action = None;
     ui.horizontal(|ui| {
-        let uris = queue_uris(tracks);
-        let is_this_list = !uris.is_empty() && queue == uris.as_slice() && current_uri.is_some();
+        let is_this_list = queue.is_some_and(|q| q.source() == source && current_uri.is_some())
+            && tracks.iter().any(|t| Some(t.uri.as_str()) == current_uri);
         let is_playing = is_this_list && matches!(status, Status::Playing(_));
         let btn_icon = if is_playing { Icon::Pause } else { Icon::Play };
         let can_play = has_user && !tracks.is_empty();
@@ -1392,7 +1771,7 @@ fn render_header_actions(
             if is_this_list {
                 action = Some(HeaderAction::Toggle);
             } else {
-                action = Some(HeaderAction::PlayQueue(uris));
+                action = Some(HeaderAction::Play);
             }
         }
     });
@@ -1433,6 +1812,10 @@ impl eframe::App for PlayerApp {
                 MediaAction::Next => self.next(),
                 MediaAction::Previous => self.previous(now),
             }
+        }
+
+        if self.should_background_load_liked() {
+            self.load_liked();
         }
 
         egui::TopBottomPanel::top("top_bar")
@@ -1485,8 +1868,6 @@ impl eframe::App for PlayerApp {
                         egui::vec2(left_w, 66.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
-                            // Zones keep their full width even when their content is narrow, so
-                            // the center zone stays centered in the window.
                             ui.set_min_width(left_w);
                             if let Some(track) = &self.track {
                                 if let Some(url) = &track.cover_url {
@@ -1539,12 +1920,38 @@ impl eframe::App for PlayerApp {
                             ui.set_min_width(center_w);
                             ui.add_space(2.0);
                             ui.horizontal(|ui| {
-                                let btn_row_w = 28.0 + 36.0 + 28.0 + 32.0;
+                                let btn_row_w = 28.0 + 16.0 + 28.0 + 16.0 + 36.0 + 16.0 + 28.0;
                                 ui.add_space(((center_w - btn_row_w) / 2.0).max(0.0));
 
-                                let can_prev = self.username.is_some()
-                                    && (self.can_restart(now)
-                                        || prev_in_queue(&self.queue, self.queue_pos).is_some());
+                                // Shuffle button
+                                let can_shuffle = self.username.is_some();
+                                let (shuf_rect, shuf_resp) = ui.allocate_exact_size(
+                                    egui::vec2(28.0, 28.0),
+                                    egui::Sense::click(),
+                                );
+                                let shuf_hovered = shuf_resp.hovered();
+                                let shuf_color = if !can_shuffle {
+                                    egui::Color32::from_rgb(70, 70, 70)
+                                } else if self.settings.shuffle {
+                                    GREEN
+                                } else if shuf_hovered {
+                                    egui::Color32::WHITE
+                                } else {
+                                    egui::Color32::from_rgb(179, 179, 179)
+                                };
+                                draw_shuffle_icon(ui.painter(), shuf_rect, shuf_color);
+                                if can_shuffle && shuf_resp.on_hover_text("Shuffle").clicked() {
+                                    self.toggle_shuffle();
+                                }
+
+                                ui.add_space(16.0);
+
+                                let can_back = self
+                                    .queue
+                                    .as_ref()
+                                    .is_some_and(|q| q.pos().is_some_and(|pos| pos > 0));
+                                let can_prev =
+                                    self.username.is_some() && (self.can_restart(now) || can_back);
                                 let prev_resp = ui
                                     .add_enabled_ui(can_prev, |ui| {
                                         icon_button(ui, Icon::Prev, 28.0, false)
@@ -1575,7 +1982,7 @@ impl eframe::App for PlayerApp {
                                 ui.add_space(16.0);
 
                                 let can_next = self.username.is_some()
-                                    && next_in_queue(&self.queue, self.queue_pos).is_some();
+                                    && self.queue.as_ref().and_then(|q| q.peek_next()).is_some();
                                 let next_resp = ui
                                     .add_enabled_ui(can_next, |ui| {
                                         icon_button(ui, Icon::Next, 28.0, false)
@@ -1661,6 +2068,28 @@ impl eframe::App for PlayerApp {
                         |ui| {
                             ui.add_space(8.0);
                             ui.add_enabled_ui(self.username.is_some(), |ui| {
+                                // Queue toggle button
+                                let (q_rect, q_resp) = ui.allocate_exact_size(
+                                    egui::vec2(24.0, 24.0),
+                                    egui::Sense::click(),
+                                );
+                                let q_color = if self.queue_open {
+                                    GREEN
+                                } else if q_resp.hovered() {
+                                    egui::Color32::WHITE
+                                } else {
+                                    egui::Color32::from_rgb(179, 179, 179)
+                                };
+                                draw_queue_icon(ui.painter(), q_rect, q_color);
+                                if q_resp.on_hover_text("Queue").clicked() {
+                                    self.queue_open = !self.queue_open;
+                                    if self.queue_open {
+                                        self.queue_scroll_to_current = true;
+                                    }
+                                }
+
+                                ui.add_space(16.0);
+
                                 ui.spacing_mut().slider_width = 120.0;
                                 if ui
                                     .add(
@@ -1713,67 +2142,11 @@ impl eframe::App for PlayerApp {
 
         self.library_panel(ctx);
 
-        egui::SidePanel::right("stats")
-            .resizable(true)
-            .default_width(240.0)
-            .frame(side_frame())
-            .show(ctx, |ui| {
-                ui.heading("Stats");
-
-                let button_text = if self.stats.is_none() {
-                    "Load stats"
-                } else {
-                    "Reload"
-                };
-                let can_load = !self.stats_loading && self.username.is_some();
-                if ui
-                    .add_enabled(can_load, egui::Button::new(button_text))
-                    .clicked()
-                {
-                    self.stats_loading = true;
-                    self.send(Command::LoadStats);
-                }
-
-                if self.stats_loading {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Loading stats...");
-                    });
-                }
-
-                let mut clicked_stats_track = None;
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if let Some(stats) = &self.stats {
-                        ui.collapsing("Recently played", |ui| {
-                            for (idx, track) in stats.recently_played.iter().enumerate() {
-                                if stats_track_entry(ui, track) && self.username.is_some() {
-                                    clicked_stats_track =
-                                        Some((queue_uris(&stats.recently_played), idx));
-                                }
-                            }
-                        });
-
-                        ui.collapsing("Top tracks", |ui| {
-                            for (idx, track) in stats.top_tracks.iter().enumerate() {
-                                if stats_track_entry(ui, track) && self.username.is_some() {
-                                    clicked_stats_track =
-                                        Some((queue_uris(&stats.top_tracks), idx));
-                                }
-                            }
-                        });
-
-                        ui.collapsing("Top artists", |ui| {
-                            for (idx, artist) in stats.top_artists.iter().enumerate() {
-                                ui.label(format!("{}. {artist}", idx + 1));
-                            }
-                        });
-                    }
-                });
-
-                if let Some((list, idx)) = clicked_stats_track {
-                    self.play_queue(list, idx);
-                }
-            });
+        if self.queue_open {
+            self.queue_panel(ctx);
+        } else {
+            self.stats_panel(ctx);
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(16))
@@ -1795,17 +2168,21 @@ impl eframe::App for PlayerApp {
                             self.search_results.len(),
                             None,
                         );
-                        let is_playing = matches!(self.status, Status::Playing(_));
+                        let source = QueueSource::Search;
                         if let Some(action) = render_header_actions(
                             ui,
                             &self.search_results,
-                            &self.queue,
+                            &source,
+                            self.queue.as_ref(),
                             &self.status,
                             self.current_uri.as_deref(),
                             self.username.is_some(),
                         ) {
                             match action {
-                                HeaderAction::PlayQueue(q) => self.play_queue(q, 0),
+                                HeaderAction::Play => {
+                                    let tracks = self.search_results.clone();
+                                    self.play_tracks(&tracks, 0, source);
+                                }
                                 HeaderAction::Toggle => self.toggle(),
                             }
                         }
@@ -1818,6 +2195,7 @@ impl eframe::App for PlayerApp {
                         } else if self.search_results.is_empty() {
                             ui.label(egui::RichText::new("No results").weak());
                         } else {
+                            let is_playing = matches!(self.status, Status::Playing(_));
                             let (action, _, _) = track_list(
                                 ui,
                                 &self.search_results,
@@ -1829,8 +2207,8 @@ impl eframe::App for PlayerApp {
                             if self.username.is_some() {
                                 match action {
                                     Some(TrackAction::Play(idx)) => {
-                                        let queue = queue_uris(&self.search_results);
-                                        self.play_queue(queue, idx);
+                                        let tracks = self.search_results.clone();
+                                        self.play_tracks(&tracks, idx, QueueSource::Search);
                                     }
                                     Some(TrackAction::Toggle) => {
                                         self.toggle();
@@ -1843,16 +2221,21 @@ impl eframe::App for PlayerApp {
                     View::Liked => {
                         let total = self.liked_total.map_or(self.liked.len(), |n| n as usize);
                         render_header(ui, View::Liked, "Liked Songs", "Playlist", total, None);
+                        let source = QueueSource::Liked;
                         if let Some(action) = render_header_actions(
                             ui,
                             &self.liked,
-                            &self.queue,
+                            &source,
+                            self.queue.as_ref(),
                             &self.status,
                             self.current_uri.as_deref(),
                             self.username.is_some(),
                         ) {
                             match action {
-                                HeaderAction::PlayQueue(q) => self.play_queue(q, 0),
+                                HeaderAction::Play => {
+                                    let tracks = self.liked.clone();
+                                    self.play_tracks(&tracks, 0, source);
+                                }
                                 HeaderAction::Toggle => self.toggle(),
                             }
                         }
@@ -1881,8 +2264,8 @@ impl eframe::App for PlayerApp {
                         if self.username.is_some() {
                             match action {
                                 Some(TrackAction::Play(idx)) => {
-                                    let queue = queue_uris(&self.liked);
-                                    self.play_queue(queue, idx);
+                                    let tracks = self.liked.clone();
+                                    self.play_tracks(&tracks, idx, QueueSource::Liked);
                                 }
                                 Some(TrackAction::Toggle) => {
                                     self.toggle();
@@ -1898,34 +2281,38 @@ impl eframe::App for PlayerApp {
                         }
                     }
                     View::Playlist => {
-                        let playlist = self
+                        let (playlist_name, track_count, image_url) = self
                             .selected_playlist
                             .as_ref()
-                            .and_then(|id| self.playlists.iter().find(|p| &p.id == id));
-                        let heading_text = playlist
-                            .map(|p| p.name.as_str())
-                            .unwrap_or("Select a playlist");
-                        let count = playlist.map_or(self.tracks.len(), |p| p.track_count as usize);
-                        let image_url = playlist.and_then(|p| p.image_url.as_deref());
+                            .and_then(|id| self.playlists.iter().find(|p| &p.id == id))
+                            .map(|p| (p.name.clone(), p.track_count as usize, p.image_url.clone()))
+                            .unwrap_or_else(|| {
+                                ("Select a playlist".to_string(), self.tracks.len(), None)
+                            });
 
                         render_header(
                             ui,
                             View::Playlist,
-                            heading_text,
+                            &playlist_name,
                             "Playlist",
-                            count,
-                            image_url,
+                            track_count,
+                            image_url.as_deref(),
                         );
+                        let source = QueueSource::Playlist(playlist_name.clone());
                         if let Some(action) = render_header_actions(
                             ui,
                             &self.tracks,
-                            &self.queue,
+                            &source,
+                            self.queue.as_ref(),
                             &self.status,
                             self.current_uri.as_deref(),
                             self.username.is_some(),
                         ) {
                             match action {
-                                HeaderAction::PlayQueue(q) => self.play_queue(q, 0),
+                                HeaderAction::Play => {
+                                    let tracks = self.tracks.clone();
+                                    self.play_tracks(&tracks, 0, source);
+                                }
                                 HeaderAction::Toggle => self.toggle(),
                             }
                         }
@@ -1951,8 +2338,12 @@ impl eframe::App for PlayerApp {
                                 if self.username.is_some() {
                                     match action {
                                         Some(TrackAction::Play(idx)) => {
-                                            let queue = queue_uris(&self.tracks);
-                                            self.play_queue(queue, idx);
+                                            let tracks = self.tracks.clone();
+                                            self.play_tracks(
+                                                &tracks,
+                                                idx,
+                                                QueueSource::Playlist(playlist_name.clone()),
+                                            );
                                         }
                                         Some(TrackAction::Toggle) => {
                                             self.toggle();
@@ -2563,26 +2954,33 @@ mod tests {
     }
 
     #[test]
-    fn test_prev_in_queue() {
-        let queue = vec!["first".into(), "second".into(), "third".into()];
-        assert_eq!(prev_in_queue(&queue, Some(2)), Some(1));
-        assert_eq!(prev_in_queue(&queue, Some(1)), Some(0));
-        assert_eq!(prev_in_queue(&queue, Some(0)), None);
-        assert_eq!(prev_in_queue(&queue, None), None);
-        assert_eq!(prev_in_queue(&queue, Some(3)), None);
-        assert_eq!(prev_in_queue(&[], None), None);
-        assert_eq!(prev_in_queue(&[], Some(0)), None);
-        assert_eq!(prev_in_queue(&[], Some(1)), None);
-    }
-
-    #[test]
     fn test_previous_restarts_after_three_seconds_and_otherwise_moves_back() {
         let (cmd_tx, mut cmd_rx) = unbounded_channel();
         let (_evt_tx, evt_rx) = unbounded_channel();
         let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
         let now = Instant::now();
-        app.queue = vec!["first".into(), "second".into()];
-        app.queue_pos = Some(1);
+
+        let tracks = vec![
+            TrackSummary {
+                uri: "first".into(),
+                name: "1".into(),
+                artists: "".into(),
+                album: "".into(),
+                duration_ms: 5000,
+                image_url: None,
+            },
+            TrackSummary {
+                uri: "second".into(),
+                name: "2".into(),
+                artists: "".into(),
+                album: "".into(),
+                duration_ms: 5000,
+                image_url: None,
+            },
+        ];
+        app.play_tracks(&tracks, 1, QueueSource::Link);
+        let _ = cmd_rx.try_recv();
+
         app.apply_event(
             Event::Playing {
                 track_id: "second".into(),
@@ -2592,10 +2990,10 @@ mod tests {
         );
         app.previous(now + Duration::from_millis(201));
         assert_eq!(cmd_rx.try_recv(), Ok(Command::Play("second".into())));
-        assert_eq!(app.queue_pos, Some(1));
+        assert_eq!(app.queue.as_ref().unwrap().pos(), Some(1));
         app.previous(now + Duration::from_millis(200));
         assert_eq!(cmd_rx.try_recv(), Ok(Command::Play("first".into())));
-        assert_eq!(app.queue_pos, Some(0));
+        assert_eq!(app.queue.as_ref().unwrap().pos(), Some(0));
         app.progress = None;
         app.previous(now);
         assert_eq!(cmd_rx.try_recv(), Err(TryRecvError::Empty));
@@ -2617,7 +3015,7 @@ mod tests {
         app.apply_event(Event::Paused { position_ms: 3001 }, now);
         app.previous(now);
         assert_eq!(cmd_rx.try_recv(), Ok(Command::Play("fixture".into())));
-        assert_eq!(app.queue_pos, None);
+        assert!(app.queue.is_none());
     }
 
     #[test]
@@ -2731,10 +3129,17 @@ mod tests {
             duration_ms: 1000,
             image_url: None,
         }];
-        let queue = queue_uris(&app.tracks);
-        app.play_queue(queue, 0);
-        assert_eq!(app.queue, vec!["fixture".to_string()]);
-        assert_eq!(app.queue_pos, Some(0));
+        let tracks = app.tracks.clone();
+        app.play_tracks(&tracks, 0, QueueSource::Search);
+        assert_eq!(
+            app.queue
+                .as_ref()
+                .unwrap()
+                .current()
+                .map(|t| t.uri.as_str()),
+            Some("fixture")
+        );
+        assert_eq!(app.queue.as_ref().unwrap().pos(), Some(0));
         assert_eq!(app.tracks.len(), 1);
         assert_eq!(cmd_rx.try_recv(), Ok(Command::Play("fixture".into())));
     }
@@ -2775,6 +3180,7 @@ mod tests {
             bitrate: 96,
             normalisation: true,
             volume_percent: 35,
+            shuffle: false,
         };
         let mut app = PlayerApp::new(cmd_tx, evt_rx, settings.clone());
         assert_eq!(app.settings, settings);
@@ -2829,80 +3235,272 @@ mod tests {
     }
 
     #[test]
-    fn test_next_in_queue() {
-        let q = vec![
-            "spotify:track:1".to_string(),
-            "spotify:track:2".to_string(),
-            "spotify:track:3".to_string(),
-        ];
-
-        assert_eq!(next_in_queue(&q, Some(0)), Some(1));
-        assert_eq!(next_in_queue(&q, Some(1)), Some(2));
-        assert_eq!(next_in_queue(&q, Some(2)), None);
-        assert_eq!(next_in_queue(&q, None), None);
-        let empty: Vec<String> = Vec::new();
-        assert_eq!(next_in_queue(&empty, None), None);
-        assert_eq!(next_in_queue(&empty, Some(0)), None);
-    }
-
-    #[test]
-    fn test_end_of_track_with_queue_advances_and_plays() {
-        let t0 = Instant::now();
-        let (cmd_tx, mut cmd_rx) = unbounded_channel();
-        let (_evt_tx, evt_rx) = unbounded_channel();
-        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
-
-        app.queue = vec![
-            "spotify:track:1".into(),
-            "spotify:track:2".into(),
-            "spotify:track:3".into(),
-        ];
-        app.queue_pos = Some(0);
-        app.status = Status::Playing("spotify:track:1".into());
-
-        app.apply_event(Event::EndOfTrack, t0);
-
-        assert_eq!(app.queue_pos, Some(1));
-        assert_eq!(
-            cmd_rx.try_recv(),
-            Ok(Command::Play("spotify:track:2".into()))
-        );
-        assert_ne!(app.status, Status::Ended);
-    }
-
-    #[test]
-    fn test_end_of_track_at_end_of_queue_ends_and_sends_nothing() {
-        let t0 = Instant::now();
-        let (cmd_tx, mut cmd_rx) = unbounded_channel();
-        let (_evt_tx, evt_rx) = unbounded_channel();
-        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
-
-        app.queue = vec!["spotify:track:1".into(), "spotify:track:2".into()];
-        app.queue_pos = Some(1);
-        app.status = Status::Playing("spotify:track:2".into());
-
-        app.apply_event(Event::EndOfTrack, t0);
-
-        assert_eq!(app.status, Status::Ended);
-        assert_eq!(app.queue_pos, Some(1));
-        assert_eq!(cmd_rx.try_recv(), Err(TryRecvError::Empty));
-    }
-
-    #[test]
     fn test_stopped_never_sends_play_and_does_not_advance_queue() {
         let t0 = Instant::now();
         let (cmd_tx, mut cmd_rx) = unbounded_channel();
         let (_evt_tx, evt_rx) = unbounded_channel();
         let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
 
-        app.queue = vec!["spotify:track:1".into(), "spotify:track:2".into()];
-        app.queue_pos = Some(0);
+        let tracks = vec![
+            TrackSummary {
+                uri: "spotify:track:1".into(),
+                name: "1".into(),
+                artists: "".into(),
+                album: "".into(),
+                duration_ms: 1000,
+                image_url: None,
+            },
+            TrackSummary {
+                uri: "spotify:track:2".into(),
+                name: "2".into(),
+                artists: "".into(),
+                album: "".into(),
+                duration_ms: 1000,
+                image_url: None,
+            },
+        ];
+        app.play_tracks(&tracks, 0, QueueSource::Link);
+        let _ = cmd_rx.try_recv();
+
         app.status = Status::Playing("spotify:track:1".into());
 
         app.apply_event(Event::Stopped, t0);
 
         assert_eq!(app.status, Status::Stopped);
-        assert_eq!(app.queue_pos, Some(0));
+        assert_eq!(app.queue.as_ref().unwrap().pos(), Some(0));
         assert_eq!(cmd_rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn test_starting_from_list_builds_queue_with_right_current() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_, evt_rx) = unbounded_channel();
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
+        let tracks = vec![
+            TrackSummary {
+                uri: "spotify:track:1".into(),
+                name: "Track 1".into(),
+                artists: "Artist 1".into(),
+                album: String::new(),
+                duration_ms: 1000,
+                image_url: None,
+            },
+            TrackSummary {
+                uri: "spotify:track:2".into(),
+                name: "Track 2".into(),
+                artists: "Artist 2".into(),
+                album: String::new(),
+                duration_ms: 2000,
+                image_url: None,
+            },
+        ];
+        app.play_tracks(&tracks, 1, QueueSource::Search);
+        assert!(app.queue.is_some());
+        let q = app.queue.as_ref().unwrap();
+        assert_eq!(q.pos(), Some(1));
+        assert_eq!(q.current().map(|t| t.uri.as_str()), Some("spotify:track:2"));
+        assert_eq!(
+            cmd_rx.try_recv(),
+            Ok(Command::Play("spotify:track:2".into()))
+        );
+    }
+
+    #[test]
+    fn test_starting_with_shuffle_is_shuffled_and_current_still_clicked() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_, evt_rx) = unbounded_channel();
+        let settings = Settings {
+            shuffle: true,
+            ..Default::default()
+        };
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, settings);
+
+        let tracks: Vec<TrackSummary> = (0..10)
+            .map(|i| TrackSummary {
+                uri: format!("spotify:track:{i}"),
+                name: format!("Track {i}"),
+                artists: "Artist".into(),
+                album: String::new(),
+                duration_ms: 1000,
+                image_url: None,
+            })
+            .collect();
+
+        app.play_tracks(&tracks, 3, QueueSource::Liked);
+        let q = app.queue.as_ref().unwrap();
+        assert!(q.is_shuffled());
+        assert_eq!(q.pos(), Some(3));
+        assert_eq!(q.current().map(|t| t.uri.as_str()), Some("spotify:track:3"));
+        assert_eq!(
+            cmd_rx.try_recv(),
+            Ok(Command::Play("spotify:track:3".into()))
+        );
+    }
+
+    #[test]
+    fn test_end_of_track_advances_and_sets_ended_at_end() {
+        let t0 = Instant::now();
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_, evt_rx) = unbounded_channel();
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
+
+        let tracks = vec![
+            TrackSummary {
+                uri: "spotify:track:1".into(),
+                name: "Track 1".into(),
+                artists: "Artist".into(),
+                album: String::new(),
+                duration_ms: 1000,
+                image_url: None,
+            },
+            TrackSummary {
+                uri: "spotify:track:2".into(),
+                name: "Track 2".into(),
+                artists: "Artist".into(),
+                album: String::new(),
+                duration_ms: 1000,
+                image_url: None,
+            },
+        ];
+        app.play_tracks(&tracks, 0, QueueSource::Playlist("Test".into()));
+        assert_eq!(
+            cmd_rx.try_recv(),
+            Ok(Command::Play("spotify:track:1".into()))
+        );
+
+        app.apply_event(Event::EndOfTrack, t0);
+        assert_eq!(
+            cmd_rx.try_recv(),
+            Ok(Command::Play("spotify:track:2".into()))
+        );
+        assert_eq!(app.queue.as_ref().unwrap().pos(), Some(1));
+
+        app.apply_event(Event::EndOfTrack, t0);
+        assert_eq!(app.status, Status::Ended);
+        assert_eq!(cmd_rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn test_next_and_previous_through_queue() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_, evt_rx) = unbounded_channel();
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
+        let now = Instant::now();
+
+        let tracks = vec![
+            TrackSummary {
+                uri: "spotify:track:1".into(),
+                name: "Track 1".into(),
+                artists: "Artist".into(),
+                album: String::new(),
+                duration_ms: 1000,
+                image_url: None,
+            },
+            TrackSummary {
+                uri: "spotify:track:2".into(),
+                name: "Track 2".into(),
+                artists: "Artist".into(),
+                album: String::new(),
+                duration_ms: 1000,
+                image_url: None,
+            },
+        ];
+        app.play_tracks(&tracks, 0, QueueSource::Liked);
+        let _ = cmd_rx.try_recv();
+
+        app.next();
+        assert_eq!(
+            cmd_rx.try_recv(),
+            Ok(Command::Play("spotify:track:2".into()))
+        );
+        assert_eq!(app.queue.as_ref().unwrap().pos(), Some(1));
+
+        app.previous(now);
+        assert_eq!(
+            cmd_rx.try_recv(),
+            Ok(Command::Play("spotify:track:1".into()))
+        );
+        assert_eq!(app.queue.as_ref().unwrap().pos(), Some(0));
+    }
+
+    #[test]
+    fn test_liked_page_loaded_appends_to_liked_queue() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_, evt_rx) = unbounded_channel();
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
+
+        let initial = vec![TrackSummary {
+            uri: "spotify:track:1".into(),
+            name: "Track 1".into(),
+            artists: "Artist".into(),
+            album: String::new(),
+            duration_ms: 1000,
+            image_url: None,
+        }];
+        app.liked = initial.clone();
+        app.play_tracks(&initial, 0, QueueSource::Liked);
+
+        let new_track = TrackSummary {
+            uri: "spotify:track:2".into(),
+            name: "Track 2".into(),
+            artists: "Artist".into(),
+            album: String::new(),
+            duration_ms: 1000,
+            image_url: None,
+        };
+
+        app.apply_event(
+            Event::LikedPageLoaded(crate::webapi::LikedPage {
+                offset: 1,
+                tracks: vec![new_track],
+                total: 2,
+            }),
+            Instant::now(),
+        );
+
+        let q = app.queue.as_ref().unwrap();
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.entries()[1].track.uri, "spotify:track:2");
+    }
+
+    #[test]
+    fn test_shuffle_toggle_flips_setting_shuffles_queue_and_sends_save() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_, evt_rx) = unbounded_channel();
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
+        assert!(!app.settings.shuffle);
+
+        let tracks: Vec<TrackSummary> = (0..8)
+            .map(|i| TrackSummary {
+                uri: format!("spotify:track:{i}"),
+                name: format!("Track {i}"),
+                artists: "Artist".into(),
+                album: String::new(),
+                duration_ms: 1000,
+                image_url: None,
+            })
+            .collect();
+        app.play_tracks(&tracks, 0, QueueSource::Search);
+        let _ = cmd_rx.try_recv();
+
+        assert!(!app.queue.as_ref().unwrap().is_shuffled());
+
+        // Toggle shuffle ON
+        app.toggle_shuffle();
+        assert!(app.settings.shuffle);
+        assert!(app.queue.as_ref().unwrap().is_shuffled());
+        assert_eq!(
+            cmd_rx.try_recv(),
+            Ok(Command::SaveSettings(app.settings.clone()))
+        );
+
+        // Toggle shuffle OFF
+        app.toggle_shuffle();
+        assert!(!app.settings.shuffle);
+        assert!(!app.queue.as_ref().unwrap().is_shuffled());
+        assert_eq!(
+            cmd_rx.try_recv(),
+            Ok(Command::SaveSettings(app.settings.clone()))
+        );
     }
 }

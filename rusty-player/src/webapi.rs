@@ -39,6 +39,17 @@ pub struct PlaylistSummary {
     pub track_count: u32,
 }
 
+/// One playable track in a playlist.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackSummary {
+    /// `spotify:track:<id>`: what `Command::Play` takes.
+    pub uri: String,
+    pub name: String,
+    /// Artist names joined with ", ".
+    pub artists: String,
+    pub duration_ms: u32,
+}
+
 /// The token as saved on disk. Expiry is wall-clock time, because `Instant` cannot be saved.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SavedToken {
@@ -135,14 +146,34 @@ impl WebApi {
                 name: item.name,
                 track_count: item.tracks.map_or(0, |t| t.total),
             }));
-            // Only follow "next" links on the API host: never send the token anywhere else.
-            url = match page.next {
-                Some(next_url) if next_url.starts_with(&format!("{API}/")) => Some(next_url),
-                Some(other) => bail!("unexpected playlist page link: {other}"),
-                None => None,
-            };
+            url = next_page(page.next)?;
         }
         Ok(playlists)
+    }
+
+    /// The playable tracks of one playlist, in playlist order (follows the paging until the end). Episodes,
+    /// local files and removed tracks are skipped.
+    pub async fn playlist_tracks(&mut self, playlist_id: &str) -> Result<Vec<TrackSummary>> {
+        if playlist_id.is_empty() || !playlist_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            bail!("not a playlist ID: {playlist_id}");
+        }
+        let mut tracks = Vec::new();
+        let mut url = Some(format!(
+            "{API}/playlists/{playlist_id}/tracks?limit=100&additional_types=track"
+        ));
+        while let Some(next) = url {
+            let page: TrackPage = self
+                .get(&next)
+                .await
+                .context("could not load the playlist's tracks")?;
+            tracks.extend(
+                page.items
+                    .into_iter()
+                    .filter_map(PlaylistEntry::into_summary),
+            );
+            url = next_page(page.next)?;
+        }
+        Ok(tracks)
     }
 
     /// GET a JSON endpoint with the access token. Refreshes the token first if it is about to expire, and
@@ -181,6 +212,66 @@ impl WebApi {
                 .context("unexpected Web API answer");
         }
         bail!("Spotify rate limit: try again later")
+    }
+}
+
+#[derive(Deserialize)]
+struct TrackPage {
+    items: Vec<PlaylistEntry>,
+    next: Option<String>,
+}
+
+/// One entry of a playlist page. Spotify calls the track `track` (older answers) or `item` (newer ones).
+#[derive(Deserialize)]
+struct PlaylistEntry {
+    track: Option<ApiTrack>,
+    item: Option<ApiTrack>,
+}
+
+#[derive(Deserialize)]
+struct ApiTrack {
+    uri: Option<String>,
+    name: Option<String>,
+    #[serde(default)]
+    artists: Vec<ApiArtist>,
+    #[serde(default)]
+    duration_ms: u32,
+    #[serde(default)]
+    is_local: bool,
+}
+
+#[derive(Deserialize)]
+struct ApiArtist {
+    name: String,
+}
+
+impl PlaylistEntry {
+    fn into_summary(self) -> Option<TrackSummary> {
+        let track = self.track.or(self.item)?;
+        let uri = track.uri?;
+        if track.is_local || !uri.starts_with("spotify:track:") {
+            return None;
+        }
+        Some(TrackSummary {
+            uri,
+            name: track.name.unwrap_or_default(),
+            artists: track
+                .artists
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            duration_ms: track.duration_ms,
+        })
+    }
+}
+
+/// The next page to fetch. Only links on the API host are followed: never send the token anywhere else.
+fn next_page(next: Option<String>) -> Result<Option<String>> {
+    match next {
+        Some(url) if url.starts_with(&format!("{API}/")) => Ok(Some(url)),
+        Some(other) => bail!("unexpected page link: {other}"),
+        None => Ok(None),
     }
 }
 
@@ -234,6 +325,40 @@ fn save_token(token: &SavedToken) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_entries_keep_only_spotify_tracks() {
+        let page: TrackPage = serde_json::from_str(
+            r#"{"next": null, "items": [
+                {"track": {"uri": "spotify:track:abc", "name": "Song", "duration_ms": 61000,
+                           "artists": [{"name": "A"}, {"name": "B"}]}},
+                {"item": {"uri": "spotify:track:def", "name": "New shape", "artists": []}},
+                {"track": {"uri": "spotify:local:x:y:z:1", "name": "Local", "is_local": true}},
+                {"track": {"uri": "spotify:episode:e", "name": "Podcast"}},
+                {"track": null}
+            ]}"#,
+        )
+        .unwrap();
+        let tracks: Vec<TrackSummary> = page
+            .items
+            .into_iter()
+            .filter_map(PlaylistEntry::into_summary)
+            .collect();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].uri, "spotify:track:abc");
+        assert_eq!(tracks[0].artists, "A, B");
+        assert_eq!(tracks[0].duration_ms, 61000);
+        assert_eq!(tracks[1].name, "New shape");
+    }
+
+    #[test]
+    fn next_page_only_follows_api_links() {
+        assert_eq!(next_page(None).unwrap(), None);
+        let ok = format!("{API}/me/playlists?offset=50");
+        assert_eq!(next_page(Some(ok.clone())).unwrap(), Some(ok));
+        assert!(next_page(Some("https://evil.example/v1/x".into())).is_err());
+        assert!(next_page(Some("https://api.spotify.com.evil.example/v1/x".into())).is_err());
+    }
 
     #[test]
     fn token_freshness_uses_the_margin() {

@@ -2,6 +2,17 @@
 
 What happened on rusty-player, newest first. Short entries: what was done, what went wrong, what was learned.
 
+## 2026-11-19: Phase 5b, playlist tracks, double-click to play
+
+- Click a playlist: its tracks load (Web API `/playlists/{id}/tracks`, 100 per page); double-click a track to play.
+  Controls and now-playing moved to a bottom bar. Terminal: `t <playlist id>`.
+- Episodes, local files and removed tracks are skipped. Answers for a playlist you already left are ignored.
+- Who built what: Lead the Web API call and engine (one shared `spawn_web_call` helper for all Web API commands);
+  builder (Gemini 3.8 Flash Low) the window (1 fix round). rust-reviewer (GPT-6 Astra): 2 fixes taken (retry after a
+  failed reload, only visible rows are drawn for long playlists), 2 minor ones left.
+- Not tested with real playlists yet (the Web API login lives in the user's AppData, not in the Claude sandbox).
+- Still single-track: playback stops after the track. A queue (next/previous) is Phase 6.
+
 ## 2026-11-19: Phase 5a, Web API login + playlists
 
 - Own Spotify app (client ID in `webapi.rs`, redirect `http://127.0.0.1:8898/login`). Login with PKCE through

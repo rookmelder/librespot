@@ -15,7 +15,7 @@ use tokio::sync::mpsc::{
 
 use crate::cli::{percent_to_volume, volume_to_percent};
 use crate::engine::{self, Command, EngineConfig, Event, EventSender, TrackInfo};
-use crate::webapi::PlaylistSummary;
+use crate::webapi::{PlaylistSummary, TrackSummary};
 
 /// Open the window and run until it is closed; then stop the engine and wait for it.
 pub fn run(to_file: Option<PathBuf>) -> Result<()> {
@@ -102,6 +102,15 @@ pub fn format_time(ms: u32) -> String {
     format!("{minutes}:{seconds:02}")
 }
 
+pub fn track_row_label(n: usize, t: &TrackSummary) -> String {
+    format!(
+        "{n}. {} — {}   {}",
+        t.name,
+        t.artists,
+        format_time(t.duration_ms)
+    )
+}
+
 pub fn playlist_label(p: &PlaylistSummary) -> String {
     format!("{} ({})", p.name, p.track_count)
 }
@@ -140,6 +149,9 @@ pub struct PlayerApp {
     playlists: Vec<PlaylistSummary>,
     playlists_loading: bool,
     selected_playlist: Option<String>,
+    tracks: Vec<TrackSummary>,
+    tracks_loading: bool,
+    tracks_for: Option<String>,
 }
 
 impl PlayerApp {
@@ -157,6 +169,9 @@ impl PlayerApp {
             playlists: Vec::new(),
             playlists_loading: false,
             selected_playlist: None,
+            tracks: Vec::new(),
+            tracks_loading: false,
+            tracks_for: None,
         }
     }
 
@@ -212,8 +227,19 @@ impl PlayerApp {
                 self.playlists = list;
                 self.playlists_loading = false;
             }
+            Event::PlaylistTracksLoaded {
+                playlist_id,
+                tracks,
+            } => {
+                if Some(&playlist_id) == self.selected_playlist.as_ref() {
+                    self.tracks = tracks;
+                    self.tracks_for = Some(playlist_id);
+                    self.tracks_loading = false;
+                }
+            }
             Event::Error(msg) => {
                 self.playlists_loading = false;
+                self.tracks_loading = false;
                 self.last_error = Some(msg);
             }
         }
@@ -256,6 +282,15 @@ impl eframe::App for PlayerApp {
             .resizable(true)
             .default_width(200.0)
             .show(ctx, |ui| {
+                match &self.username {
+                    Some(name) => {
+                        ui.label(format!("Logged in as {name}"));
+                    }
+                    None => {
+                        ui.label("Logging in...");
+                    }
+                }
+
                 ui.heading("Playlists");
 
                 let button_text = if self.playlists.is_empty() {
@@ -280,13 +315,28 @@ impl eframe::App for PlayerApp {
                 }
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    let mut clicked_playlist = None;
                     for playlist in &self.playlists {
                         let selected = self.selected_playlist.as_deref() == Some(&playlist.id);
                         if ui
                             .selectable_label(selected, playlist_label(playlist))
                             .clicked()
                         {
-                            self.selected_playlist = Some(playlist.id.clone());
+                            clicked_playlist = Some(playlist.id.clone());
+                        }
+                    }
+
+                    if let Some(id) = clicked_playlist {
+                        let same_selected = self.selected_playlist.as_deref() == Some(&id);
+                        // Load unless these tracks are shown already or are loading right now.
+                        let is_different = !same_selected
+                            || (self.tracks_for.as_deref() != Some(&id) && !self.tracks_loading);
+                        self.selected_playlist = Some(id.clone());
+                        if is_different {
+                            self.tracks_loading = true;
+                            self.tracks.clear();
+                            self.tracks_for = None;
+                            self.send(Command::LoadPlaylistTracks(id));
                         }
                     }
 
@@ -296,27 +346,17 @@ impl eframe::App for PlayerApp {
                 });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("rusty-player");
-            match &self.username {
-                Some(name) => {
-                    ui.label(format!("Logged in as {name}"));
-                }
-                None => {
-                    ui.label("Logging in...");
-                }
-            }
-
+        egui::TopBottomPanel::bottom("player").show(ctx, |ui| {
             if let Some(track) = &self.track {
                 ui.horizontal(|ui| {
                     if let Some(ref url) = track.cover_url {
                         ui.add(
                             egui::Image::new(url.as_str())
-                                .fit_to_exact_size(egui::vec2(120.0, 120.0))
+                                .fit_to_exact_size(egui::vec2(64.0, 64.0))
                                 .corner_radius(4.0),
                         );
                     } else {
-                        ui.allocate_exact_size(egui::vec2(120.0, 120.0), egui::Sense::hover());
+                        ui.allocate_exact_size(egui::vec2(64.0, 64.0), egui::Sense::hover());
                     }
 
                     ui.vertical(|ui| {
@@ -388,6 +428,52 @@ impl eframe::App for PlayerApp {
 
             if let Some(msg) = &self.last_error {
                 ui.label(egui::RichText::new(format!("Error: {msg}")).color(egui::Color32::RED));
+            }
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let heading_text = self
+                .selected_playlist
+                .as_ref()
+                .and_then(|id| self.playlists.iter().find(|p| &p.id == id))
+                .map(|p| p.name.as_str())
+                .unwrap_or("Select a playlist");
+            ui.heading(heading_text);
+
+            if self.tracks_loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading tracks...");
+                });
+            } else if self.selected_playlist.is_some() {
+                if self.tracks.is_empty() {
+                    ui.label(egui::RichText::new("No playable tracks").weak());
+                } else {
+                    // Only the visible rows are built each frame (`show_rows`), so long playlists stay cheap.
+                    let row_height = ui.spacing().interact_size.y;
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show_rows(ui, row_height, self.tracks.len(), |ui, rows| {
+                            let playing_uri = match &self.status {
+                                Status::Playing(uri) => Some(uri.clone()),
+                                _ => None,
+                            };
+                            let mut play_track = None;
+                            let first = rows.start;
+                            for (offset, track) in self.tracks[rows].iter().enumerate() {
+                                let idx = first + offset;
+                                let is_current = playing_uri.as_deref() == Some(track.uri.as_str());
+                                let text = track_row_label(idx + 1, track);
+                                let response = ui.selectable_label(is_current, text);
+                                if response.double_clicked() {
+                                    play_track = Some(track.uri.clone());
+                                }
+                            }
+                            if let Some(uri) = play_track {
+                                self.send(Command::Play(uri));
+                            }
+                        });
+                }
             }
         });
 
@@ -664,6 +750,99 @@ mod tests {
         app.apply_event(Event::Error("failed to fetch playlists".into()), t0);
         assert!(!app.playlists_loading);
         assert_eq!(app.last_error.as_deref(), Some("failed to fetch playlists"));
+    }
+
+    #[test]
+    fn test_track_row_label() {
+        let t = TrackSummary {
+            uri: "spotify:track:xyz".into(),
+            name: "Song".into(),
+            artists: "A, B".into(),
+            duration_ms: 61_000,
+        };
+        assert_eq!(track_row_label(1, &t), "1. Song — A, B   1:01");
+    }
+
+    #[test]
+    fn test_apply_event_playlist_tracks_loaded_selected() {
+        let t0 = Instant::now();
+        let (_evt_tx, mut app) = create_test_app();
+        app.selected_playlist = Some("pl1".into());
+        app.tracks_loading = true;
+
+        let tracks = vec![
+            TrackSummary {
+                uri: "spotify:track:1".into(),
+                name: "Track One".into(),
+                artists: "Artist A".into(),
+                duration_ms: 120_000,
+            },
+            TrackSummary {
+                uri: "spotify:track:2".into(),
+                name: "Track Two".into(),
+                artists: "Artist B".into(),
+                duration_ms: 180_000,
+            },
+        ];
+
+        app.apply_event(
+            Event::PlaylistTracksLoaded {
+                playlist_id: "pl1".into(),
+                tracks: tracks.clone(),
+            },
+            t0,
+        );
+
+        assert_eq!(app.tracks, tracks);
+        assert_eq!(app.tracks_for.as_deref(), Some("pl1"));
+        assert!(!app.tracks_loading);
+    }
+
+    #[test]
+    fn test_apply_event_playlist_tracks_loaded_other_ignored() {
+        let t0 = Instant::now();
+        let (_evt_tx, mut app) = create_test_app();
+        app.selected_playlist = Some("pl1".into());
+        app.tracks_loading = true;
+        let original_tracks = vec![TrackSummary {
+            uri: "spotify:track:original".into(),
+            name: "Original".into(),
+            artists: "Original Artist".into(),
+            duration_ms: 60_000,
+        }];
+        app.tracks = original_tracks.clone();
+        app.tracks_for = Some("pl1".into());
+
+        let new_tracks = vec![TrackSummary {
+            uri: "spotify:track:other".into(),
+            name: "Other Track".into(),
+            artists: "Other Artist".into(),
+            duration_ms: 90_000,
+        }];
+
+        app.apply_event(
+            Event::PlaylistTracksLoaded {
+                playlist_id: "pl2".into(),
+                tracks: new_tracks,
+            },
+            t0,
+        );
+
+        // Tracks and tracks_loading unchanged
+        assert_eq!(app.tracks, original_tracks);
+        assert_eq!(app.tracks_for.as_deref(), Some("pl1"));
+        assert!(app.tracks_loading);
+    }
+
+    #[test]
+    fn test_apply_event_error_clears_tracks_loading() {
+        let t0 = Instant::now();
+        let (_evt_tx, mut app) = create_test_app();
+        app.tracks_loading = true;
+
+        app.apply_event(Event::Error("something went wrong".into()), t0);
+        assert!(!app.tracks_loading);
+        assert_eq!(app.last_error.as_deref(), Some("something went wrong"));
     }
 
     #[test]

@@ -45,6 +45,14 @@ pub fn parse_line(line: &str) -> Result<Option<Command>, String> {
     let (first, rest) = trimmed
         .split_once(char::is_whitespace)
         .unwrap_or((trimmed, ""));
+    if first.eq_ignore_ascii_case("t") {
+        let id = rest.trim();
+        return if id.is_empty() {
+            Err("usage: t <playlist id>".to_string())
+        } else {
+            Ok(Some(Command::LoadPlaylistTracks(id.to_string())))
+        };
+    }
     if first.eq_ignore_ascii_case("v") {
         match rest.trim().parse::<u8>() {
             Ok(n) if n <= 100 => Ok(Some(Command::SetVolume(percent_to_volume(n)))),
@@ -67,7 +75,7 @@ pub async fn run(to_file: Option<PathBuf>) -> Result<()> {
     ));
 
     println!(
-        "Commands: <track id or link> = play, p = pause, r = resume, s = stop, v <0-100> = volume, l = list playlists, q = quit"
+        "Commands: <track id or link> = play, p = pause, r = resume, s = stop, v <0-100> = volume, l = list playlists, t <id> = playlist tracks, q = quit"
     );
 
     // Reading stdin blocks, so it gets its own OS thread instead of a Tokio task.
@@ -114,6 +122,11 @@ pub async fn run(to_file: Option<PathBuf>) -> Result<()> {
                     );
                 }
             }
+            Event::PlaylistTracksLoaded { tracks, .. } => {
+                for track in tracks {
+                    println!("{} - {}  {}", track.artists, track.name, track.uri);
+                }
+            }
             Event::Error(msg) => eprintln!("Error: {msg}"),
         }
     }
@@ -146,6 +159,15 @@ mod tests {
         for bad in ["v", "v abc", "v 101", "v -1"] {
             assert_eq!(parse_line(bad), Err(VOLUME_ERROR.to_string()), "{bad}");
         }
+
+        assert_eq!(parse_line("l"), Ok(Some(Command::LoadPlaylists)));
+        assert_eq!(
+            parse_line("t 37i9dQZF1DXcBWIGoYBM5M"),
+            Ok(Some(Command::LoadPlaylistTracks(
+                "37i9dQZF1DXcBWIGoYBM5M".into()
+            )))
+        );
+        assert_eq!(parse_line("t"), Err("usage: t <playlist id>".to_string()));
 
         let link = "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT";
         assert_eq!(parse_line(link), Ok(Some(Command::Play(link.to_string()))));

@@ -6,7 +6,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use crate::webapi::{PlaylistSummary, WebApi};
+use crate::webapi::{PlaylistSummary, TrackSummary, WebApi};
 use librespot::core::SpotifyUri;
 use librespot::metadata::audio::{AudioItem, UniqueFields};
 use librespot::playback::{
@@ -59,6 +59,8 @@ pub enum Command {
     SetVolume(u16),
     /// Load the user's playlists through the Web API (logs in through the browser the first time).
     LoadPlaylists,
+    /// Load one playlist's tracks through the Web API (by playlist ID).
+    LoadPlaylistTracks(String),
     /// Stop playing, log out and end `run_engine`.
     Quit,
 }
@@ -88,6 +90,11 @@ pub enum Event {
     VolumeChanged(u16),
     /// Answer to `Command::LoadPlaylists`.
     PlaylistsLoaded(Vec<PlaylistSummary>),
+    /// Answer to `Command::LoadPlaylistTracks`.
+    PlaylistTracksLoaded {
+        playlist_id: String,
+        tracks: Vec<TrackSummary>,
+    },
     Error(String),
 }
 
@@ -286,16 +293,22 @@ fn handle_command(
             mixer.set_volume(volume);
             evt_tx.send(Event::VolumeChanged(volume))
         }
+        // Web API calls run as their own task, so the player keeps reacting to commands meanwhile.
         Command::LoadPlaylists => {
-            // Web API calls run as their own task, so the player keeps reacting to commands meanwhile.
-            let web_api = Arc::clone(web_api);
-            let evt_tx = evt_tx.clone();
-            tokio::spawn(async move {
-                let event = match load_playlists(&web_api).await {
-                    Ok(playlists) => Event::PlaylistsLoaded(playlists),
-                    Err(error) => Event::Error(format!("{error:#}")),
-                };
-                let _ = evt_tx.send(event);
+            spawn_web_call(web_api, evt_tx, |api| {
+                Box::pin(async move { api.playlists().await.map(Event::PlaylistsLoaded) })
+            });
+            Ok(())
+        }
+        Command::LoadPlaylistTracks(playlist_id) => {
+            spawn_web_call(web_api, evt_tx, move |api| {
+                Box::pin(async move {
+                    let tracks = api.playlist_tracks(&playlist_id).await?;
+                    Ok(Event::PlaylistTracksLoaded {
+                        playlist_id,
+                        tracks,
+                    })
+                })
             });
             Ok(())
         }
@@ -311,13 +324,44 @@ fn handle_command(
 /// (login, requests); one request at a time is fine for a single user.
 type SharedWebApi = Arc<tokio::sync::Mutex<Option<WebApi>>>;
 
-async fn load_playlists(web_api: &SharedWebApi) -> anyhow::Result<Vec<PlaylistSummary>> {
+type WebCall = Box<
+    dyn for<'a> FnOnce(
+            &'a mut WebApi,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<Event>> + Send + 'a>,
+        > + Send,
+>;
+
+/// Run one Web API call as its own task (logging in first if needed) and send its result as an event.
+fn spawn_web_call(
+    web_api: &SharedWebApi,
+    evt_tx: &EventSender,
+    call: impl for<'a> FnOnce(
+        &'a mut WebApi,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<Event>> + Send + 'a>,
+    > + Send
+    + 'static,
+) {
+    let web_api = Arc::clone(web_api);
+    let evt_tx = evt_tx.clone();
+    let call: WebCall = Box::new(call);
+    tokio::spawn(async move {
+        let event = match with_web_api(&web_api, call).await {
+            Ok(event) => event,
+            Err(error) => Event::Error(format!("{error:#}")),
+        };
+        let _ = evt_tx.send(event);
+    });
+}
+
+async fn with_web_api(web_api: &SharedWebApi, call: WebCall) -> anyhow::Result<Event> {
     let mut guard = web_api.lock().await;
     if guard.is_none() {
         *guard = Some(WebApi::login().await?);
     }
     match guard.as_mut() {
-        Some(api) => api.playlists().await,
+        Some(api) => call(api).await,
         None => anyhow::bail!("Web API login did not finish"),
     }
 }

@@ -2,6 +2,16 @@
 
 What happened on rusty-player, newest first. Short entries: what was done, what went wrong, what was learned.
 
+## 2026-11-19: Shuffle like YouTube Music (Up Next queue)
+
+- New `rusty-player/src/queue.rs` holds a `Queue` (list of `QueueEntry`, each with a unique `id` and a `TrackSummary`), `pos` = index of the song now playing, and `source` (`QueueSource`: Playlist(name), Liked, Search, Stats, Link).
+- Shuffle is done by the app, not by Spotify: turning shuffle on mixes only the songs after the current one; turning it off puts the original order back and keeps the current song playing. The setting is saved in `settings.toml` (`shuffle`, default false).
+- Up Next panel (queue button in the player bar) shows the list with "Now playing" and "Next up" labels; rows can be dragged to a new place (`move_entry`), and the playing position follows the current song by its id, so moving the current song behind 10 others just means those 10 play first. Double-click a row jumps to it (`jump_to`).
+- Liked Songs + shuffle: the rest of the liked pages are loaded in the background and appended to the queue so shuffle can pick from all of them.
+- Rust notes: `Option<Queue>` is used when no queue exists yet (`None`), checked cleanly with `is_some_and`. Entries use their own unique `id` instead of the track URI because the same song can appear in the list twice. We use a tiny custom random number generator instead of a crate to keep dependencies minimal on MSRV 1.85. Drag-and-drop uses egui's `dnd_drag_source`.
+- Problem we hit: a close test looked like the window would not close; really `Process.CloseMainWindow()` picked a hidden console window, not the app. Posting WM_CLOSE to the real window closes it in ~100 ms.
+- Tests: 89 pass, clippy clean.
+
 ## 2026-11-19: Phase 6, UI overhaul (thumbnails, row play buttons, centered bar)
 
 - UI overhaul after user feedback: track table rows (56 px) with a play/pause icon on hover or for the playing row, 40x40 album thumbnail, title + artists, album column, duration.

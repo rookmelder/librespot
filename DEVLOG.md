@@ -2,6 +2,16 @@
 
 What happened on rusty-player, newest first. Short entries: what was done, what went wrong, what was learned.
 
+## 2026-11-19: Phase 6, UI overhaul (thumbnails, row play buttons, centered bar)
+
+- UI overhaul after user feedback: track table rows (56 px) with a play/pause icon on hover or for the playing row, 40x40 album thumbnail, title + artists, album column, duration.
+- Playlist header with 160x160 cover, name, song count and a big green play button that plays the whole list; library entries with 48x48 thumbnails; Liked Songs purple heart cover.
+- Player icons drawn with shapes (no more boxes); bottom bar in three fixed zones (30/40/30%) so the controls are centered.
+- Web API data updates: `TrackSummary` got `album` and `image_url` (smallest album image >= 64 px), `PlaylistSummary` got `image_url`.
+- Who built what: builderplus run on Codex timed out after 45 min with no changes; split into builder (Gemini 3.8 Flash Low) for Web API data and builderplus (agy Gemini 3.8 Flash Medium) for the UI (13 min, 1 fix round). Lead restored Liked Songs Reload button and fixed the left bar zone width collapse.
+- Checks: 77 tests pass, clippy clean, window responds and closes. Track rows with thumbnails not seen yet (need user's Web API login).
+- Lesson: very big UI tasks time out on Codex; split them (data first, then UI) or use agy Flash Medium.
+
 ## 2026-11-19: Phase 6, Spotify-style look, liked paging, prev/next, settings, media keys
 
 - Spotify-like redesign: dark theme (#121212, black side panels, green #1db954), Segoe UI font with Segoe UI Emoji fallback (emoji in playlist names), top search bar + settings gear, left "Your Library", center track table (#, title + artists, duration; playing track in green), right Stats, bottom player bar (cover, title, ⏮ play/pause ⏭, progress, volume).

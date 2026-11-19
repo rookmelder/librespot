@@ -39,6 +39,7 @@ pub struct PlaylistSummary {
     pub id: String,
     pub name: String,
     pub track_count: u32,
+    pub image_url: Option<String>,
 }
 
 /// One playable track in a playlist.
@@ -49,7 +50,9 @@ pub struct TrackSummary {
     pub name: String,
     /// Artist names joined with ", ".
     pub artists: String,
+    pub album: String,
     pub duration_ms: u32,
+    pub image_url: Option<String>,
 }
 
 /// One page of the user's playable Liked Songs.
@@ -151,6 +154,8 @@ impl WebApi {
             // Newer answers call the count `items`, older ones `tracks`.
             items: Option<Tracks>,
             tracks: Option<Tracks>,
+            #[serde(default)]
+            images: Option<Vec<ApiImage>>,
         }
         #[derive(Deserialize)]
         struct Tracks {
@@ -161,10 +166,16 @@ impl WebApi {
         let mut url = Some(format!("{API}/me/playlists?limit=50"));
         while let Some(next) = url {
             let page: Page = self.get(&next).await.context("could not load playlists")?;
-            playlists.extend(page.items.into_iter().map(|item| PlaylistSummary {
-                id: item.id,
-                name: item.name,
-                track_count: item.items.or(item.tracks).map_or(0, |t| t.total),
+            playlists.extend(page.items.into_iter().map(|item| {
+                PlaylistSummary {
+                    id: item.id,
+                    name: item.name,
+                    track_count: item.items.or(item.tracks).map_or(0, |t| t.total),
+                    image_url: item
+                        .images
+                        .and_then(|imgs| imgs.into_iter().next())
+                        .map(|img| img.url),
+                }
             }));
             url = next_page(page.next)?;
         }
@@ -377,12 +388,26 @@ struct PlaylistEntry {
 struct ApiTrack {
     uri: Option<String>,
     name: Option<String>,
+    album: Option<ApiAlbum>,
     #[serde(default)]
     artists: Vec<ApiArtist>,
     #[serde(default)]
     duration_ms: u32,
     #[serde(default)]
     is_local: bool,
+}
+
+#[derive(Deserialize)]
+struct ApiAlbum {
+    name: Option<String>,
+    #[serde(default)]
+    images: Vec<ApiImage>,
+}
+
+#[derive(Clone, Deserialize)]
+struct ApiImage {
+    url: String,
+    width: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -396,6 +421,27 @@ impl PlaylistEntry {
     }
 }
 
+/// Pick the smallest image with width >= 64, else the largest, else None.
+fn pick_album_image(images: &[ApiImage]) -> Option<String> {
+    if images.is_empty() {
+        return None;
+    }
+    // Smallest image with width >= 64
+    let ge_64 = images
+        .iter()
+        .filter(|img| img.width.is_some_and(|w| w >= 64))
+        .min_by_key(|img| img.width.unwrap());
+
+    if let Some(img) = ge_64 {
+        return Some(img.url.clone());
+    }
+
+    // Else the largest
+    let largest = images.iter().max_by_key(|img| img.width);
+
+    largest.map(|img| img.url.clone())
+}
+
 impl ApiTrack {
     /// `None` for local files, episodes and entries without a URI.
     fn into_summary(self) -> Option<TrackSummary> {
@@ -403,6 +449,13 @@ impl ApiTrack {
         if self.is_local || !uri.starts_with("spotify:track:") {
             return None;
         }
+        let (album_name, image_url) = match self.album {
+            Some(album) => {
+                let img = pick_album_image(&album.images);
+                (album.name.unwrap_or_default(), img)
+            }
+            None => (String::new(), None),
+        };
         Some(TrackSummary {
             uri,
             name: self.name.unwrap_or_default(),
@@ -412,7 +465,9 @@ impl ApiTrack {
                 .map(|a| a.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
+            album: album_name,
             duration_ms: self.duration_ms,
+            image_url,
         })
     }
 }
@@ -517,7 +572,11 @@ mod tests {
         assert_eq!(tracks[0].uri, "spotify:track:abc");
         assert_eq!(tracks[0].artists, "A, B");
         assert_eq!(tracks[0].duration_ms, 61000);
+        assert_eq!(tracks[0].album, "");
+        assert_eq!(tracks[0].image_url, None);
         assert_eq!(tracks[1].name, "New shape");
+        assert_eq!(tracks[1].album, "");
+        assert_eq!(tracks[1].image_url, None);
     }
 
     #[test]
@@ -544,13 +603,17 @@ mod tests {
                     uri: "spotify:track:first".into(),
                     name: "First".into(),
                     artists: "A".into(),
+                    album: String::new(),
                     duration_ms: 1000,
+                    image_url: None,
                 },
                 TrackSummary {
                     uri: "spotify:track:second".into(),
                     name: "Second".into(),
                     artists: "B, C".into(),
+                    album: String::new(),
                     duration_ms: 2000,
+                    image_url: None,
                 },
             ]
         );
@@ -581,13 +644,17 @@ mod tests {
                     uri: "spotify:track:first".into(),
                     name: "First".into(),
                     artists: "A".into(),
+                    album: String::new(),
                     duration_ms: 1000,
+                    image_url: None,
                 },
                 TrackSummary {
                     uri: "spotify:track:second".into(),
                     name: "Second".into(),
                     artists: String::new(),
+                    album: String::new(),
                     duration_ms: 0,
+                    image_url: None,
                 },
             ]
         );
@@ -622,7 +689,9 @@ mod tests {
                     uri: "spotify:track:liked".into(),
                     name: "Liked".into(),
                     artists: "Artist".into(),
+                    album: String::new(),
                     duration_ms: 3000,
+                    image_url: None,
                 }],
                 total: 123,
             }
@@ -647,6 +716,108 @@ mod tests {
             .collect();
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].name, "Song");
+        assert_eq!(tracks[0].album, "");
+        assert_eq!(tracks[0].image_url, None);
+    }
+
+    #[test]
+    fn track_album_images_picks_smallest_ge_64() {
+        let json = r#"{
+            "uri": "spotify:track:abc",
+            "name": "Song",
+            "album": {
+                "name": "Album Name",
+                "images": [
+                    {"url": "https://img/640.jpg", "width": 640},
+                    {"url": "https://img/300.jpg", "width": 300},
+                    {"url": "https://img/64.jpg", "width": 64}
+                ]
+            }
+        }"#;
+        let track: ApiTrack = serde_json::from_str(json).unwrap();
+        let summary = track.into_summary().unwrap();
+        assert_eq!(summary.album, "Album Name");
+        assert_eq!(summary.image_url.as_deref(), Some("https://img/64.jpg"));
+    }
+
+    #[test]
+    fn track_album_images_fallback_to_largest_when_all_under_64() {
+        let json = r#"{
+            "uri": "spotify:track:abc",
+            "name": "Song",
+            "album": {
+                "name": "Tiny Album",
+                "images": [
+                    {"url": "https://img/32.jpg", "width": 32},
+                    {"url": "https://img/48.jpg", "width": 48},
+                    {"url": "https://img/16.jpg", "width": 16}
+                ]
+            }
+        }"#;
+        let track: ApiTrack = serde_json::from_str(json).unwrap();
+        let summary = track.into_summary().unwrap();
+        assert_eq!(summary.album, "Tiny Album");
+        assert_eq!(summary.image_url.as_deref(), Some("https://img/48.jpg"));
+    }
+
+    #[test]
+    fn track_album_missing_or_empty_images() {
+        let json_missing_album = r#"{"uri": "spotify:track:abc", "name": "Song"}"#;
+        let track: ApiTrack = serde_json::from_str(json_missing_album).unwrap();
+        let summary = track.into_summary().unwrap();
+        assert_eq!(summary.album, "");
+        assert_eq!(summary.image_url, None);
+
+        let json_empty_album = r#"{"uri": "spotify:track:abc", "name": "Song", "album": null}"#;
+        let track: ApiTrack = serde_json::from_str(json_empty_album).unwrap();
+        let summary = track.into_summary().unwrap();
+        assert_eq!(summary.album, "");
+        assert_eq!(summary.image_url, None);
+
+        let json_empty_images = r#"{"uri": "spotify:track:abc", "name": "Song", "album": {"name": "No Art", "images": []}}"#;
+        let track: ApiTrack = serde_json::from_str(json_empty_images).unwrap();
+        let summary = track.into_summary().unwrap();
+        assert_eq!(summary.album, "No Art");
+        assert_eq!(summary.image_url, None);
+    }
+
+    #[test]
+    fn playlist_images_picks_first_or_none_when_missing_or_null() {
+        #[derive(Deserialize)]
+        struct PageItem {
+            images: Option<Vec<ApiImage>>,
+        }
+
+        let with_images: PageItem = serde_json::from_str(
+            r#"{"images": [{"url": "https://img/pl_large.jpg", "width": 640}, {"url": "https://img/pl_small.jpg", "width": 60}]}"#,
+        )
+        .unwrap();
+        let first_url = with_images
+            .images
+            .and_then(|imgs| imgs.into_iter().next())
+            .map(|img| img.url);
+        assert_eq!(first_url.as_deref(), Some("https://img/pl_large.jpg"));
+
+        let null_images: PageItem = serde_json::from_str(r#"{"images": null}"#).unwrap();
+        let null_url = null_images
+            .images
+            .and_then(|imgs| imgs.into_iter().next())
+            .map(|img| img.url);
+        assert_eq!(null_url, None);
+
+        let missing_images: PageItem = serde_json::from_str(r#"{}"#).unwrap();
+        let missing_url = missing_images
+            .images
+            .and_then(|imgs| imgs.into_iter().next())
+            .map(|img| img.url);
+        assert_eq!(missing_url, None);
+
+        let empty_images: PageItem = serde_json::from_str(r#"{"images": []}"#).unwrap();
+        let empty_url = empty_images
+            .images
+            .and_then(|imgs| imgs.into_iter().next())
+            .map(|img| img.url);
+        assert_eq!(empty_url, None);
     }
 
     #[test]

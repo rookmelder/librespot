@@ -101,6 +101,11 @@ fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// True when a Web API login was saved earlier, so loading data will not open a browser.
+pub fn has_saved_token() -> bool {
+    token_path().is_ok_and(|path| path.is_file())
+}
+
 fn token_path() -> Result<PathBuf> {
     let appdata = std::env::var_os("APPDATA").context("APPDATA is not set")?;
     Ok(PathBuf::from(appdata)

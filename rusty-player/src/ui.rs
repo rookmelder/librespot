@@ -539,6 +539,15 @@ impl PlayerApp {
             Event::LoggedIn { username } => {
                 self.username = Some(username);
                 self.status = Status::Idle;
+                // Load the library right away, but only when that cannot open a browser (Web API
+                // login done before). Otherwise the user clicks "Load playlists" the first time.
+                if self.playlists.is_empty()
+                    && !self.playlists_loading
+                    && crate::webapi::has_saved_token()
+                {
+                    self.playlists_loading = true;
+                    self.send(Command::LoadPlaylists);
+                }
             }
             Event::Playing {
                 track_id,

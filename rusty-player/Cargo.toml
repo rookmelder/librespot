@@ -18,6 +18,9 @@ env_logger = "0.11"
 eframe = "0.32.3"
 egui_extras = { version = "0.32", features = ["http", "image"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lints]
 workspace = true

@@ -4861,6 +4861,9 @@ dependencies = [
  "image",
  "librespot",
  "log",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

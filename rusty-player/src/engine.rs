@@ -6,6 +6,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use crate::webapi::{PlaylistSummary, WebApi};
 use librespot::core::SpotifyUri;
 use librespot::metadata::audio::{AudioItem, UniqueFields};
 use librespot::playback::{
@@ -18,16 +19,17 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, error::SendError};
 
 /// The engine's end of the event channel. After every event it calls `notify`, so a window can redraw at
 /// once instead of polling (egui: `ctx.request_repaint()`). The terminal passes a `notify` that does nothing.
+#[derive(Clone)]
 pub struct EventSender {
     tx: UnboundedSender<Event>,
-    notify: Box<dyn Fn() + Send + Sync>,
+    notify: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl EventSender {
     pub fn new(tx: UnboundedSender<Event>, notify: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             tx,
-            notify: Box::new(notify),
+            notify: Arc::new(notify),
         }
     }
 
@@ -55,6 +57,8 @@ pub enum Command {
     Stop,
     /// Volume on librespot's scale: 0 (silent) ..= 65535 (full).
     SetVolume(u16),
+    /// Load the user's playlists through the Web API (logs in through the browser the first time).
+    LoadPlaylists,
     /// Stop playing, log out and end `run_engine`.
     Quit,
 }
@@ -82,6 +86,8 @@ pub enum Event {
     Stopped,
     EndOfTrack,
     VolumeChanged(u16),
+    /// Answer to `Command::LoadPlaylists`.
+    PlaylistsLoaded(Vec<PlaylistSummary>),
     Error(String),
 }
 
@@ -196,10 +202,12 @@ pub async fn run_engine(
     );
     let mut player_events = player.get_player_event_channel();
 
+    let web_api: SharedWebApi = Arc::new(tokio::sync::Mutex::new(None));
+
     // Commands that arrived during login, in the order they were sent.
     let mut quit = false;
     for command in pending {
-        if let Flow::Quit = handle_command(command, &player, mixer.as_ref(), &evt_tx) {
+        if let Flow::Quit = handle_command(command, &player, mixer.as_ref(), &evt_tx, &web_api) {
             quit = true;
             break;
         }
@@ -211,7 +219,7 @@ pub async fn run_engine(
                 command = cmd_rx.recv() => {
                     match command {
                         Some(command) => {
-                            if let Flow::Quit = handle_command(command, &player, mixer.as_ref(), &evt_tx) {
+                            if let Flow::Quit = handle_command(command, &player, mixer.as_ref(), &evt_tx, &web_api) {
                                 break;
                             }
                         }
@@ -252,6 +260,7 @@ fn handle_command(
     player: &Player,
     mixer: &dyn Mixer,
     evt_tx: &EventSender,
+    web_api: &SharedWebApi,
 ) -> Flow {
     let sent = match command {
         Command::Play(text) => match crate::track::parse_track(&text) {
@@ -277,11 +286,39 @@ fn handle_command(
             mixer.set_volume(volume);
             evt_tx.send(Event::VolumeChanged(volume))
         }
+        Command::LoadPlaylists => {
+            // Web API calls run as their own task, so the player keeps reacting to commands meanwhile.
+            let web_api = Arc::clone(web_api);
+            let evt_tx = evt_tx.clone();
+            tokio::spawn(async move {
+                let event = match load_playlists(&web_api).await {
+                    Ok(playlists) => Event::PlaylistsLoaded(playlists),
+                    Err(error) => Event::Error(format!("{error:#}")),
+                };
+                let _ = evt_tx.send(event);
+            });
+            Ok(())
+        }
         Command::Quit => return Flow::Quit,
     };
     match sent {
         Ok(()) => Flow::Continue,
         Err(_) => Flow::Quit,
+    }
+}
+
+/// The Web API client, created on first use. A tokio `Mutex` because it is held across `.await`
+/// (login, requests); one request at a time is fine for a single user.
+type SharedWebApi = Arc<tokio::sync::Mutex<Option<WebApi>>>;
+
+async fn load_playlists(web_api: &SharedWebApi) -> anyhow::Result<Vec<PlaylistSummary>> {
+    let mut guard = web_api.lock().await;
+    if guard.is_none() {
+        *guard = Some(WebApi::login().await?);
+    }
+    match guard.as_mut() {
+        Some(api) => api.playlists().await,
+        None => anyhow::bail!("Web API login did not finish"),
     }
 }
 

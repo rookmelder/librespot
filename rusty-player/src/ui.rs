@@ -15,6 +15,7 @@ use tokio::sync::mpsc::{
 
 use crate::cli::{percent_to_volume, volume_to_percent};
 use crate::engine::{self, Command, EngineConfig, Event, EventSender, TrackInfo};
+use crate::webapi::PlaylistSummary;
 
 /// Open the window and run until it is closed; then stop the engine and wait for it.
 pub fn run(to_file: Option<PathBuf>) -> Result<()> {
@@ -43,13 +44,16 @@ pub fn run(to_file: Option<PathBuf>) -> Result<()> {
                 cmd_rx,
                 EventSender::new(evt_tx, notify),
             ));
+            // A first-time Web API login waits on a blocking thread for the browser. Don't let it keep
+            // the app alive after the window is closed.
+            runtime.shutdown_timeout(std::time::Duration::from_secs(1));
         })
         .context("could not start the engine thread")?;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("rusty-player")
-            .with_inner_size([520.0, 360.0]),
+            .with_inner_size([760.0, 400.0]),
         ..Default::default()
     };
     let window_result = eframe::run_native(
@@ -98,6 +102,10 @@ pub fn format_time(ms: u32) -> String {
     format!("{minutes}:{seconds:02}")
 }
 
+pub fn playlist_label(p: &PlaylistSummary) -> String {
+    format!("{} ({})", p.name, p.track_count)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Status {
     LoggingIn,
@@ -129,6 +137,9 @@ pub struct PlayerApp {
     last_error: Option<String>,
     progress: Option<Progress>,
     track: Option<TrackInfo>,
+    playlists: Vec<PlaylistSummary>,
+    playlists_loading: bool,
+    selected_playlist: Option<String>,
 }
 
 impl PlayerApp {
@@ -143,6 +154,9 @@ impl PlayerApp {
             last_error: None,
             progress: None,
             track: None,
+            playlists: Vec::new(),
+            playlists_loading: false,
+            selected_playlist: None,
         }
     }
 
@@ -194,7 +208,12 @@ impl PlayerApp {
                 let percent = volume_to_percent(v).min(100) as u8;
                 self.volume_percent = percent;
             }
+            Event::PlaylistsLoaded(list) => {
+                self.playlists = list;
+                self.playlists_loading = false;
+            }
             Event::Error(msg) => {
+                self.playlists_loading = false;
                 self.last_error = Some(msg);
             }
         }
@@ -232,6 +251,50 @@ impl eframe::App for PlayerApp {
                 }
             }
         }
+
+        egui::SidePanel::left("playlists")
+            .resizable(true)
+            .default_width(200.0)
+            .show(ctx, |ui| {
+                ui.heading("Playlists");
+
+                let button_text = if self.playlists.is_empty() {
+                    "Load playlists"
+                } else {
+                    "Reload"
+                };
+                let can_load = !self.playlists_loading && self.username.is_some();
+                if ui
+                    .add_enabled(can_load, egui::Button::new(button_text))
+                    .clicked()
+                {
+                    self.playlists_loading = true;
+                    self.send(Command::LoadPlaylists);
+                }
+
+                if self.playlists_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading... (a browser may open the first time)");
+                    });
+                }
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for playlist in &self.playlists {
+                        let selected = self.selected_playlist.as_deref() == Some(&playlist.id);
+                        if ui
+                            .selectable_label(selected, playlist_label(playlist))
+                            .clicked()
+                        {
+                            self.selected_playlist = Some(playlist.id.clone());
+                        }
+                    }
+
+                    if self.playlists.is_empty() && !self.playlists_loading {
+                        ui.label(egui::RichText::new("No playlists loaded").weak());
+                    }
+                });
+            });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("rusty-player");
@@ -556,6 +619,51 @@ mod tests {
         app.apply_event(Event::Error("stream warning".into()), t0);
         assert_eq!(app.status, Status::Playing("spotify:track:123".into()));
         assert_eq!(app.last_error.as_deref(), Some("stream warning"));
+    }
+
+    #[test]
+    fn test_playlist_label() {
+        let p = PlaylistSummary {
+            id: "pl1".into(),
+            name: "Chill".into(),
+            track_count: 12,
+        };
+        assert_eq!(playlist_label(&p), "Chill (12)");
+    }
+
+    #[test]
+    fn test_apply_event_playlists_loaded() {
+        let t0 = Instant::now();
+        let (_evt_tx, mut app) = create_test_app();
+        app.playlists_loading = true;
+
+        let playlists = vec![
+            PlaylistSummary {
+                id: "1".into(),
+                name: "Rock".into(),
+                track_count: 50,
+            },
+            PlaylistSummary {
+                id: "2".into(),
+                name: "Jazz".into(),
+                track_count: 20,
+            },
+        ];
+
+        app.apply_event(Event::PlaylistsLoaded(playlists.clone()), t0);
+        assert_eq!(app.playlists, playlists);
+        assert!(!app.playlists_loading);
+    }
+
+    #[test]
+    fn test_apply_event_error_clears_playlists_loading() {
+        let t0 = Instant::now();
+        let (_evt_tx, mut app) = create_test_app();
+        app.playlists_loading = true;
+
+        app.apply_event(Event::Error("failed to fetch playlists".into()), t0);
+        assert!(!app.playlists_loading);
+        assert_eq!(app.last_error.as_deref(), Some("failed to fetch playlists"));
     }
 
     #[test]

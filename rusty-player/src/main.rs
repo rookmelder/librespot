@@ -8,6 +8,7 @@ mod engine;
 mod login;
 mod track;
 mod ui;
+mod webapi;
 
 use std::path::PathBuf;
 
@@ -59,9 +60,12 @@ fn main() -> Result<()> {
     let options = parse_args(&args)?;
 
     if options.cli {
-        tokio::runtime::Runtime::new()
-            .context("could not start the Tokio runtime")?
-            .block_on(cli::run(options.to_file))
+        let runtime =
+            tokio::runtime::Runtime::new().context("could not start the Tokio runtime")?;
+        let result = runtime.block_on(cli::run(options.to_file));
+        // Don't wait for a first-time Web API login still waiting on the browser.
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+        result
     } else {
         ui::run(options.to_file)
     }

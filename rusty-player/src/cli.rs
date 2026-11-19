@@ -33,6 +33,9 @@ pub fn parse_line(line: &str) -> Result<Option<Command>, String> {
     if trimmed.eq_ignore_ascii_case("s") {
         return Ok(Some(Command::Stop));
     }
+    if trimmed.eq_ignore_ascii_case("l") {
+        return Ok(Some(Command::LoadPlaylists));
+    }
     if trimmed.eq_ignore_ascii_case("q") {
         return Ok(Some(Command::Quit));
     }
@@ -64,7 +67,7 @@ pub async fn run(to_file: Option<PathBuf>) -> Result<()> {
     ));
 
     println!(
-        "Commands: <track id or link> = play, p = pause, r = resume, s = stop, v <0-100> = volume, q = quit"
+        "Commands: <track id or link> = play, p = pause, r = resume, s = stop, v <0-100> = volume, l = list playlists, q = quit"
     );
 
     // Reading stdin blocks, so it gets its own OS thread instead of a Tokio task.
@@ -103,6 +106,14 @@ pub async fn run(to_file: Option<PathBuf>) -> Result<()> {
             Event::Stopped => println!("Stopped"),
             Event::EndOfTrack => println!("Track ended"),
             Event::VolumeChanged(v) => println!("Volume {}%", volume_to_percent(v)),
+            Event::PlaylistsLoaded(playlists) => {
+                for playlist in playlists {
+                    println!(
+                        "{} ({} tracks) {}",
+                        playlist.name, playlist.track_count, playlist.id
+                    );
+                }
+            }
             Event::Error(msg) => eprintln!("Error: {msg}"),
         }
     }

@@ -2,6 +2,19 @@
 
 What happened on rusty-player, newest first. Short entries: what was done, what went wrong, what was learned.
 
+## 2026-11-19: Phase 5a, Web API login + playlists
+
+- Own Spotify app (client ID in `webapi.rs`, redirect `http://127.0.0.1:8898/login`). Login with PKCE through
+  librespot's oauth crate, no extra library; token saved in `%APPDATA%\rusty-player\webapi_token.json` and refreshed
+  automatically. HTTP with reqwest; 429 rate limits wait once (max 30 s).
+- New command `LoadPlaylists` -> event `PlaylistsLoaded`. Web API calls run as their own Tokio task, so playback
+  keeps reacting. Window: left panel with "Load playlists" and a selectable list. Terminal: `l`.
+- Who built what: Lead `webapi.rs` and engine changes (login code stays with the Lead); builder (Gemini 3.8 Flash
+  Low) the panel, first try. rust-reviewer (GPT-6 Astra) found 3 real issues, fixed: closing during the first
+  browser login could hang (runtime shutdown now waits max 1 s), a crash mid-save could corrupt the token file
+  (temp file + rename), a bad "next page" link could send the token to another host (only api.spotify.com).
+- Not tested yet: the browser login and real playlists need the user.
+
 ## 2026-11-19: Phase 4, now playing (title, artists, album, cover, progress)
 
 - Engine: librespot's `TrackChanged` event already carries name, artists, album, length and cover URLs, so no

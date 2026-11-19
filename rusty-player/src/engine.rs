@@ -61,6 +61,8 @@ pub enum Command {
     LoadPlaylists,
     /// Load one playlist's tracks through the Web API (by playlist ID).
     LoadPlaylistTracks(String),
+    /// Search tracks through the Web API.
+    Search(String),
     /// Stop playing, log out and end `run_engine`.
     Quit,
 }
@@ -93,6 +95,11 @@ pub enum Event {
     /// Answer to `Command::LoadPlaylistTracks`.
     PlaylistTracksLoaded {
         playlist_id: String,
+        tracks: Vec<TrackSummary>,
+    },
+    /// Answer to `Command::Search`.
+    SearchResults {
+        query: String,
         tracks: Vec<TrackSummary>,
     },
     Error(String),
@@ -308,6 +315,15 @@ fn handle_command(
                         playlist_id,
                         tracks,
                     })
+                })
+            });
+            Ok(())
+        }
+        Command::Search(query) => {
+            spawn_web_call(web_api, evt_tx, move |api| {
+                Box::pin(async move {
+                    let tracks = api.search_tracks(&query).await?;
+                    Ok(Event::SearchResults { query, tracks })
                 })
             });
             Ok(())

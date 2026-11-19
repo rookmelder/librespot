@@ -136,6 +136,12 @@ fn status_text(status: &Status) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum View {
+    Playlist,
+    Search,
+}
+
 pub struct PlayerApp {
     cmd_tx: UnboundedSender<Command>,
     evt_rx: UnboundedReceiver<Event>,
@@ -152,6 +158,11 @@ pub struct PlayerApp {
     tracks: Vec<TrackSummary>,
     tracks_loading: bool,
     tracks_for: Option<String>,
+    search_input: String,
+    search_loading: bool,
+    search_query: Option<String>,
+    search_results: Vec<TrackSummary>,
+    view: View,
 }
 
 impl PlayerApp {
@@ -172,6 +183,11 @@ impl PlayerApp {
             tracks: Vec::new(),
             tracks_loading: false,
             tracks_for: None,
+            search_input: String::new(),
+            search_loading: false,
+            search_query: None,
+            search_results: Vec::new(),
+            view: View::Playlist,
         }
     }
 
@@ -237,9 +253,16 @@ impl PlayerApp {
                     self.tracks_loading = false;
                 }
             }
+            Event::SearchResults { query, tracks } => {
+                if Some(&query) == self.search_query.as_ref() {
+                    self.search_results = tracks;
+                    self.search_loading = false;
+                }
+            }
             Event::Error(msg) => {
                 self.playlists_loading = false;
                 self.tracks_loading = false;
+                self.search_loading = false;
                 self.last_error = Some(msg);
             }
         }
@@ -262,6 +285,30 @@ impl PlayerApp {
     }
 }
 
+fn track_list(
+    ui: &mut egui::Ui,
+    tracks: &[TrackSummary],
+    playing_uri: Option<&str>,
+) -> Option<String> {
+    let row_height = ui.spacing().interact_size.y;
+    let mut play_track = None;
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show_rows(ui, row_height, tracks.len(), |ui, rows| {
+            let first = rows.start;
+            for (offset, track) in tracks[rows].iter().enumerate() {
+                let idx = first + offset;
+                let is_current = playing_uri == Some(track.uri.as_str());
+                let text = track_row_label(idx + 1, track);
+                let response = ui.selectable_label(is_current, text);
+                if response.double_clicked() {
+                    play_track = Some(track.uri.clone());
+                }
+            }
+        });
+    play_track
+}
+
 impl eframe::App for PlayerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = Instant::now();
@@ -277,6 +324,32 @@ impl eframe::App for PlayerApp {
                 }
             }
         }
+
+        egui::TopBottomPanel::top("search").show(ctx, |ui| {
+            ui.add_enabled_ui(self.username.is_some(), |ui| {
+                ui.horizontal(|ui| {
+                    let text_edit = egui::TextEdit::singleline(&mut self.search_input)
+                        .hint_text("Search songs")
+                        .desired_width(300.0);
+                    let response = ui.add(text_edit);
+
+                    let enter_pressed =
+                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let search_clicked = ui.button("Search").clicked();
+
+                    if enter_pressed || search_clicked {
+                        let trimmed = self.search_input.trim();
+                        if !trimmed.is_empty() {
+                            self.search_query = Some(trimmed.to_string());
+                            self.search_loading = true;
+                            self.view = View::Search;
+                            self.search_results.clear();
+                            self.send(Command::Search(trimmed.to_string()));
+                        }
+                    }
+                });
+            });
+        });
 
         egui::SidePanel::left("playlists")
             .resizable(true)
@@ -327,6 +400,7 @@ impl eframe::App for PlayerApp {
                     }
 
                     if let Some(id) = clicked_playlist {
+                        self.view = View::Playlist;
                         let same_selected = self.selected_playlist.as_deref() == Some(&id);
                         // Load unless these tracks are shown already or are loading right now.
                         let is_different = !same_selected
@@ -432,47 +506,51 @@ impl eframe::App for PlayerApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let heading_text = self
-                .selected_playlist
-                .as_ref()
-                .and_then(|id| self.playlists.iter().find(|p| &p.id == id))
-                .map(|p| p.name.as_str())
-                .unwrap_or("Select a playlist");
-            ui.heading(heading_text);
+            let playing_uri = match &self.status {
+                Status::Playing(uri) => Some(uri.as_str()),
+                _ => None,
+            };
 
-            if self.tracks_loading {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Loading tracks...");
-                });
-            } else if self.selected_playlist.is_some() {
-                if self.tracks.is_empty() {
-                    ui.label(egui::RichText::new("No playable tracks").weak());
-                } else {
-                    // Only the visible rows are built each frame (`show_rows`), so long playlists stay cheap.
-                    let row_height = ui.spacing().interact_size.y;
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show_rows(ui, row_height, self.tracks.len(), |ui, rows| {
-                            let playing_uri = match &self.status {
-                                Status::Playing(uri) => Some(uri.clone()),
-                                _ => None,
-                            };
-                            let mut play_track = None;
-                            let first = rows.start;
-                            for (offset, track) in self.tracks[rows].iter().enumerate() {
-                                let idx = first + offset;
-                                let is_current = playing_uri.as_deref() == Some(track.uri.as_str());
-                                let text = track_row_label(idx + 1, track);
-                                let response = ui.selectable_label(is_current, text);
-                                if response.double_clicked() {
-                                    play_track = Some(track.uri.clone());
-                                }
-                            }
-                            if let Some(uri) = play_track {
-                                self.send(Command::Play(uri));
-                            }
+            match self.view {
+                View::Search => {
+                    let heading_text = match &self.search_query {
+                        Some(q) => format!("Search: {q}"),
+                        None => "Search".to_string(),
+                    };
+                    ui.heading(heading_text);
+
+                    if self.search_loading {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Searching...");
                         });
+                    } else if self.search_results.is_empty() {
+                        ui.label(egui::RichText::new("No results").weak());
+                    } else if let Some(uri) = track_list(ui, &self.search_results, playing_uri) {
+                        self.send(Command::Play(uri));
+                    }
+                }
+                View::Playlist => {
+                    let heading_text = self
+                        .selected_playlist
+                        .as_ref()
+                        .and_then(|id| self.playlists.iter().find(|p| &p.id == id))
+                        .map(|p| p.name.as_str())
+                        .unwrap_or("Select a playlist");
+                    ui.heading(heading_text);
+
+                    if self.tracks_loading {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Loading tracks...");
+                        });
+                    } else if self.selected_playlist.is_some() {
+                        if self.tracks.is_empty() {
+                            ui.label(egui::RichText::new("No playable tracks").weak());
+                        } else if let Some(uri) = track_list(ui, &self.tracks, playing_uri) {
+                            self.send(Command::Play(uri));
+                        }
+                    }
                 }
             }
         });
@@ -843,6 +921,76 @@ mod tests {
         app.apply_event(Event::Error("something went wrong".into()), t0);
         assert!(!app.tracks_loading);
         assert_eq!(app.last_error.as_deref(), Some("something went wrong"));
+    }
+
+    #[test]
+    fn test_apply_event_search_results_matching_query() {
+        let t0 = Instant::now();
+        let (_evt_tx, mut app) = create_test_app();
+        app.search_query = Some("queen".into());
+        app.search_loading = true;
+
+        let tracks = vec![TrackSummary {
+            uri: "spotify:track:bohemian".into(),
+            name: "Bohemian Rhapsody".into(),
+            artists: "Queen".into(),
+            duration_ms: 354_000,
+        }];
+
+        app.apply_event(
+            Event::SearchResults {
+                query: "queen".into(),
+                tracks: tracks.clone(),
+            },
+            t0,
+        );
+
+        assert_eq!(app.search_results, tracks);
+        assert!(!app.search_loading);
+    }
+
+    #[test]
+    fn test_apply_event_search_results_older_query_ignored() {
+        let t0 = Instant::now();
+        let (_evt_tx, mut app) = create_test_app();
+        app.search_query = Some("queen".into());
+        app.search_loading = true;
+        let original_results = vec![TrackSummary {
+            uri: "spotify:track:orig".into(),
+            name: "Original".into(),
+            artists: "Queen".into(),
+            duration_ms: 200_000,
+        }];
+        app.search_results = original_results.clone();
+
+        let old_results = vec![TrackSummary {
+            uri: "spotify:track:old".into(),
+            name: "Old Result".into(),
+            artists: "Old Artist".into(),
+            duration_ms: 180_000,
+        }];
+
+        app.apply_event(
+            Event::SearchResults {
+                query: "beatles".into(),
+                tracks: old_results,
+            },
+            t0,
+        );
+
+        assert_eq!(app.search_results, original_results);
+        assert!(app.search_loading);
+    }
+
+    #[test]
+    fn test_apply_event_error_clears_search_loading() {
+        let t0 = Instant::now();
+        let (_evt_tx, mut app) = create_test_app();
+        app.search_loading = true;
+
+        app.apply_event(Event::Error("search failed".into()), t0);
+        assert!(!app.search_loading);
+        assert_eq!(app.last_error.as_deref(), Some("search failed"));
     }
 
     #[test]

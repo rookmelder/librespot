@@ -2,6 +2,14 @@
 
 What happened on rusty-player, newest first. Short entries: what was done, what went wrong, what was learned.
 
+## 2026-11-19: Phase 5c, search
+
+- Search bar at the top; results (up to 20: Spotify allows 10 per request, so 2 pages) show in the middle and
+  play on double-click. Older searches' answers are ignored. Terminal: `? <words>`.
+- Who built what: Lead the Web API search (query escaped by `Url::parse_with_params`) and engine command; builder
+  (Gemini 3.8 Flash Low) the window, first try, with one shared track list for playlists and search.
+- No separate review: same pattern as 5b. Not tested with a real search yet.
+
 ## 2026-11-19: Phase 5b, playlist tracks, double-click to play
 
 - Fix after the user's test: Spotify deprecated `/playlists/{id}/tracks` (403) for `/playlists/{id}/items`, the

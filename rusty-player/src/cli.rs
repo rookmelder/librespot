@@ -45,6 +45,14 @@ pub fn parse_line(line: &str) -> Result<Option<Command>, String> {
     let (first, rest) = trimmed
         .split_once(char::is_whitespace)
         .unwrap_or((trimmed, ""));
+    if first == "?" {
+        let query = rest.trim();
+        return if query.is_empty() {
+            Err("usage: ? <search words>".to_string())
+        } else {
+            Ok(Some(Command::Search(query.to_string())))
+        };
+    }
     if first.eq_ignore_ascii_case("t") {
         let id = rest.trim();
         return if id.is_empty() {
@@ -75,7 +83,7 @@ pub async fn run(to_file: Option<PathBuf>) -> Result<()> {
     ));
 
     println!(
-        "Commands: <track id or link> = play, p = pause, r = resume, s = stop, v <0-100> = volume, l = list playlists, t <id> = playlist tracks, q = quit"
+        "Commands: <track id or link> = play, p = pause, r = resume, s = stop, v <0-100> = volume, l = list playlists, t <id> = playlist tracks, ? <words> = search, q = quit"
     );
 
     // Reading stdin blocks, so it gets its own OS thread instead of a Tokio task.
@@ -122,7 +130,7 @@ pub async fn run(to_file: Option<PathBuf>) -> Result<()> {
                     );
                 }
             }
-            Event::PlaylistTracksLoaded { tracks, .. } => {
+            Event::PlaylistTracksLoaded { tracks, .. } | Event::SearchResults { tracks, .. } => {
                 for track in tracks {
                     println!("{} - {}  {}", track.artists, track.name, track.uri);
                 }

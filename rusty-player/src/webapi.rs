@@ -30,6 +30,8 @@ const API: &str = "https://api.spotify.com/v1";
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 /// Longest wait we accept from a 429 "Retry-After" before giving up.
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
+/// Search pages to fetch (10 results each: Spotify's maximum per request).
+const SEARCH_PAGES: usize = 2;
 
 /// One playlist in the user's list.
 #[derive(Debug, Clone, PartialEq)]
@@ -181,6 +183,37 @@ impl WebApi {
         Ok(tracks)
     }
 
+    /// Search tracks. Spotify returns at most 10 per request, so this fetches up to `SEARCH_PAGES` pages.
+    pub async fn search_tracks(&mut self, query: &str) -> Result<Vec<TrackSummary>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Url::parse_with_params escapes the query text (spaces, &, #, ...).
+        let first = reqwest::Url::parse_with_params(
+            &format!("{API}/search"),
+            &[("q", query), ("type", "track"), ("limit", "10")],
+        )
+        .context("could not build the search URL")?;
+
+        let mut tracks = Vec::new();
+        let mut url = Some(first.to_string());
+        for _ in 0..SEARCH_PAGES {
+            let Some(next) = url else { break };
+            let answer: SearchAnswer = self.get(&next).await.context("search failed")?;
+            tracks.extend(
+                answer
+                    .tracks
+                    .items
+                    .into_iter()
+                    .flatten()
+                    .filter_map(ApiTrack::into_summary),
+            );
+            url = next_page(answer.tracks.next)?;
+        }
+        Ok(tracks)
+    }
+
     /// GET a JSON endpoint with the access token. Refreshes the token first if it is about to expire, and
     /// waits once on a 429 (rate limit) when Spotify asks for a short wait.
     async fn get<T: DeserializeOwned>(&mut self, url: &str) -> Result<T> {
@@ -252,23 +285,40 @@ struct ApiArtist {
 
 impl PlaylistEntry {
     fn into_summary(self) -> Option<TrackSummary> {
-        let track = self.item.or(self.track)?;
-        let uri = track.uri?;
-        if track.is_local || !uri.starts_with("spotify:track:") {
+        self.item.or(self.track)?.into_summary()
+    }
+}
+
+impl ApiTrack {
+    /// `None` for local files, episodes and entries without a URI.
+    fn into_summary(self) -> Option<TrackSummary> {
+        let uri = self.uri?;
+        if self.is_local || !uri.starts_with("spotify:track:") {
             return None;
         }
         Some(TrackSummary {
             uri,
-            name: track.name.unwrap_or_default(),
-            artists: track
+            name: self.name.unwrap_or_default(),
+            artists: self
                 .artists
                 .iter()
                 .map(|a| a.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
-            duration_ms: track.duration_ms,
+            duration_ms: self.duration_ms,
         })
     }
+}
+
+#[derive(Deserialize)]
+struct SearchAnswer {
+    tracks: SearchTracks,
+}
+
+#[derive(Deserialize)]
+struct SearchTracks {
+    items: Vec<Option<ApiTrack>>,
+    next: Option<String>,
 }
 
 fn is_forbidden(error: &anyhow::Error) -> bool {
@@ -361,6 +411,26 @@ mod tests {
         assert_eq!(tracks[0].artists, "A, B");
         assert_eq!(tracks[0].duration_ms, 61000);
         assert_eq!(tracks[1].name, "New shape");
+    }
+
+    #[test]
+    fn search_answer_keeps_tracks_and_skips_nulls() {
+        let answer: SearchAnswer = serde_json::from_str(
+            r#"{"tracks": {"next": null, "items": [
+                {"uri": "spotify:track:abc", "name": "Song", "duration_ms": 1000, "artists": [{"name": "A"}]},
+                null
+            ]}}"#,
+        )
+        .unwrap();
+        let tracks: Vec<TrackSummary> = answer
+            .tracks
+            .items
+            .into_iter()
+            .flatten()
+            .filter_map(ApiTrack::into_summary)
+            .collect();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].name, "Song");
     }
 
     #[test]

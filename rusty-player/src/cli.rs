@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::engine::{self, Command, EngineConfig, Event, EventSender};
+use crate::settings::Settings;
 
 /// Volume on librespot's scale (0..=65535) from a percentage. Requires `percent <= 100`.
 pub fn percent_to_volume(percent: u8) -> u16 {
@@ -17,16 +18,13 @@ pub fn volume_to_percent(volume: u16) -> u16 {
     ((volume as u32 * 100 + 32767) / 65535) as u16
 }
 
-/// One typed line -> a command. `Ok(None)` for an empty line, `Err` with a message for a bad volume.
+/// One typed line -> a command. `Ok(None)` for an empty line, `Err` for invalid command arguments.
 pub fn parse_line(line: &str) -> Result<Option<Command>, String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Ok(None);
     }
 
-    if trimmed.eq_ignore_ascii_case("liked") {
-        return Ok(Some(Command::LoadLikedTracks));
-    }
     if trimmed.eq_ignore_ascii_case("stats") {
         return Ok(Some(Command::LoadStats));
     }
@@ -52,6 +50,16 @@ pub fn parse_line(line: &str) -> Result<Option<Command>, String> {
     let (first, rest) = trimmed
         .split_once(char::is_whitespace)
         .unwrap_or((trimmed, ""));
+    if first.eq_ignore_ascii_case("liked") {
+        let rest = rest.trim();
+        let offset = if rest.is_empty() {
+            0
+        } else {
+            rest.parse::<u32>()
+                .map_err(|_| "usage: liked [offset]".to_string())?
+        };
+        return Ok(Some(Command::LoadLikedPage { offset }));
+    }
     if first == "?" {
         let query = rest.trim();
         return if query.is_empty() {
@@ -79,18 +87,18 @@ pub fn parse_line(line: &str) -> Result<Option<Command>, String> {
 }
 
 /// Run the terminal controller until the engine stops.
-pub async fn run(to_file: Option<PathBuf>) -> Result<()> {
+pub async fn run(to_file: Option<PathBuf>, settings: Settings) -> Result<()> {
     let (cmd_tx, cmd_rx) = unbounded_channel::<Command>();
     let (evt_tx, mut evt_rx) = unbounded_channel::<Event>();
 
     let engine_handle = tokio::spawn(engine::run_engine(
-        EngineConfig { to_file },
+        EngineConfig { to_file, settings },
         cmd_rx,
         EventSender::new(evt_tx, || {}),
     ));
 
     println!(
-        "Commands: <track id or link> = play, p = pause, r = resume, s = stop, v <0-100> = volume, l = list playlists, t <id> = playlist tracks, liked = Liked Songs, stats = listening stats, ? <words> = search, q = quit"
+        "Commands: <track id or link> = play, p = pause, r = resume, s = stop, v <0-100> = volume, l = list playlists, t <id> = playlist tracks, liked [offset] = Liked Songs page, stats = listening stats, ? <words> = search, q = quit"
     );
 
     // Reading stdin blocks, so it gets its own OS thread instead of a Tokio task.
@@ -137,13 +145,19 @@ pub async fn run(to_file: Option<PathBuf>) -> Result<()> {
                     );
                 }
             }
-            Event::PlaylistTracksLoaded { tracks, .. }
-            | Event::SearchResults { tracks, .. }
-            | Event::LikedTracksLoaded(tracks) => {
+            Event::PlaylistTracksLoaded { tracks, .. } | Event::SearchResults { tracks, .. } => {
                 for track in tracks {
                     println!("{} - {}  {}", track.artists, track.name, track.uri);
                 }
             }
+            Event::LikedPageLoaded(page) => {
+                let end = page.offset.saturating_add(page.tracks.len() as u32);
+                println!("({}-{} of {})", page.offset, end, page.total);
+                for track in page.tracks {
+                    println!("{} - {}  {}", track.artists, track.name, track.uri);
+                }
+            }
+            Event::SettingsSaved => println!("Settings saved"),
             Event::StatsLoaded(stats) => {
                 println!("Recently played:");
                 for track in stats.recently_played {
@@ -216,12 +230,22 @@ mod tests {
     #[test]
     fn parse_liked_and_stats_commands() {
         for text in ["liked", "LIKED", " LiKeD "] {
-            assert_eq!(parse_line(text), Ok(Some(Command::LoadLikedTracks)));
+            assert_eq!(
+                parse_line(text),
+                Ok(Some(Command::LoadLikedPage { offset: 0 }))
+            );
+        }
+        assert_eq!(
+            parse_line("liked 50"),
+            Ok(Some(Command::LoadLikedPage { offset: 50 }))
+        );
+        for text in ["liked x", "liked extra", "liked -1", "liked 50 extra"] {
+            assert_eq!(parse_line(text), Err("usage: liked [offset]".into()));
         }
         for text in ["stats", "STATS", " StAtS "] {
             assert_eq!(parse_line(text), Ok(Some(Command::LoadStats)));
         }
-        for text in ["liked extra", "stats extra", "liked123", "stats123"] {
+        for text in ["stats extra", "liked123", "stats123"] {
             assert_eq!(parse_line(text), Ok(Some(Command::Play(text.into()))));
         }
         assert_eq!(parse_line("l"), Ok(Some(Command::LoadPlaylists)));

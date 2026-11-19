@@ -6,6 +6,7 @@
 mod cli;
 mod engine;
 mod login;
+mod settings;
 mod track;
 mod ui;
 mod webapi;
@@ -58,16 +59,17 @@ fn main() -> Result<()> {
         })
         .collect::<Result<Vec<String>>>()?;
     let options = parse_args(&args)?;
+    let settings = settings::load();
 
     if options.cli {
         let runtime =
             tokio::runtime::Runtime::new().context("could not start the Tokio runtime")?;
-        let result = runtime.block_on(cli::run(options.to_file));
+        let result = runtime.block_on(cli::run(options.to_file, settings));
         // Don't wait for a first-time Web API login still waiting on the browser.
         runtime.shutdown_timeout(std::time::Duration::from_secs(1));
         result
     } else {
-        ui::run(options.to_file)
+        ui::run(options.to_file, settings)
     }
 }
 

@@ -2,6 +2,18 @@
 
 What happened on rusty-player, newest first. Short entries: what was done, what went wrong, what was learned.
 
+## 2026-11-19: Phase 6, Spotify-style look, liked paging, prev/next, settings, media keys
+
+- Spotify-like redesign: dark theme (#121212, black side panels, green #1db954), Segoe UI font with Segoe UI Emoji fallback (emoji in playlist names), top search bar + settings gear, left "Your Library", center track table (#, title + artists, duration; playing track in green), right Stats, bottom player bar (cover, title, ⏮ play/pause ⏭, progress, volume).
+- Liked Songs now load 50 at a time; the next 50 load when you scroll near the end (`LoadLikedPage { offset }` -> `LikedPageLoaded`). A failed page stops auto-loading and shows a Retry row.
+- Previous/next buttons use the list a song was started from; Previous restarts the song if more than 3 s in.
+- Settings window: bitrate 96/160/320, volume normalisation (apply at next start), "Play by link". Saved to `%APPDATA%\rusty-player\settings.toml` (`settings.rs`); volume is remembered too.
+- Windows media keys / media overlay via souvlaki 0.8.3. Creating it while the window was being created made the window hang (Not Responding, 0% CPU); fixed by creating it on the first frame. `RUSTY_PLAYER_NO_MEDIA_KEYS=1` starts without media keys.
+- Who built what: builderplus (GPT-6.1 Sol on Codex) did the backend (webapi, engine, settings.rs, cli), the redesign and the fixes; the Lead found the hang and checked. rust-reviewer (GPT-6 Astra) found 3 liked-paging problems (retry loop after an error, endless requests on an empty page, cloning the whole list on double-click), all fixed.
+- Checks: 71 tests pass, clippy clean, window responds, closes in about 0.1 s.
+- Release build: `rusty-player.exe` 16.1 MB; idle RAM about 182 MB (working set) right after start, logged in, nothing playing.
+- Known: the play/pause symbol in the bottom bar may render as a box. Not tested with the user's account yet.
+
 ## 2026-11-19: Phase 5d, Liked Songs, stats, auto-play next
 
 - Added Liked Songs (left panel entry, Web API `GET /me/tracks`, 50 per page, all pages).

@@ -52,6 +52,14 @@ pub struct TrackSummary {
     pub duration_ms: u32,
 }
 
+/// One page of the user's playable Liked Songs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LikedPage {
+    pub offset: u32,
+    pub tracks: Vec<TrackSummary>,
+    pub total: u32,
+}
+
 /// The user's recent listening and short-term favorites.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Stats {
@@ -191,23 +199,13 @@ impl WebApi {
         Ok(tracks)
     }
 
-    /// All playable Liked Songs, following the paging until the end.
-    pub async fn liked_tracks(&mut self) -> Result<Vec<TrackSummary>> {
-        let mut tracks = Vec::new();
-        let mut url = Some(format!("{API}/me/tracks?limit=50"));
-        while let Some(next) = url {
-            let page: TrackPage = self
-                .get(&next)
-                .await
-                .context("could not load Liked Songs")?;
-            tracks.extend(
-                page.items
-                    .into_iter()
-                    .filter_map(PlaylistEntry::into_summary),
-            );
-            url = next_page(page.next)?;
-        }
-        Ok(tracks)
+    /// One page of playable Liked Songs, starting at `offset`.
+    pub async fn liked_tracks_page(&mut self, offset: u32) -> Result<LikedPage> {
+        let page: LikedTracksPage = self
+            .get(&format!("{API}/me/tracks?limit=50&offset={offset}"))
+            .await
+            .context("could not load Liked Songs")?;
+        Ok(page.into_page(offset))
     }
 
     /// The most recent page of played tracks, in the API's order.
@@ -336,6 +334,26 @@ impl WebApi {
 struct TrackPage {
     items: Vec<PlaylistEntry>,
     next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LikedTracksPage {
+    items: Vec<PlaylistEntry>,
+    total: u32,
+}
+
+impl LikedTracksPage {
+    fn into_page(self, offset: u32) -> LikedPage {
+        LikedPage {
+            offset,
+            tracks: self
+                .items
+                .into_iter()
+                .filter_map(PlaylistEntry::into_summary)
+                .collect(),
+            total: self.total,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -586,9 +604,9 @@ mod tests {
     }
 
     #[test]
-    fn liked_tracks_reads_track_entries() {
-        let page: TrackPage = serde_json::from_str(
-            r#"{"next": null, "items": [
+    fn liked_tracks_page_reads_track_entries_and_total() {
+        let page: LikedTracksPage = serde_json::from_str(
+            r#"{"next": null, "total": 123, "items": [
                 {"track": {"uri": "spotify:track:liked", "name": "Liked", "duration_ms": 3000,
                            "artists": [{"name": "Artist"}]}, "added_at": "2026-01-01T12:00:00Z"},
                 {"track": null},
@@ -596,19 +614,18 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let tracks: Vec<TrackSummary> = page
-            .items
-            .into_iter()
-            .filter_map(PlaylistEntry::into_summary)
-            .collect();
         assert_eq!(
-            tracks,
-            vec![TrackSummary {
-                uri: "spotify:track:liked".into(),
-                name: "Liked".into(),
-                artists: "Artist".into(),
-                duration_ms: 3000,
-            }]
+            page.into_page(50),
+            LikedPage {
+                offset: 50,
+                tracks: vec![TrackSummary {
+                    uri: "spotify:track:liked".into(),
+                    name: "Liked".into(),
+                    artists: "Artist".into(),
+                    duration_ms: 3000,
+                }],
+                total: 123,
+            }
         );
     }
 

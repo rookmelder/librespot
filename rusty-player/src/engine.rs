@@ -6,7 +6,8 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use crate::webapi::{PlaylistSummary, Stats, TrackSummary, WebApi};
+use crate::settings::{self, Settings};
+use crate::webapi::{LikedPage, PlaylistSummary, Stats, TrackSummary, WebApi};
 use librespot::core::SpotifyUri;
 use librespot::metadata::audio::{AudioItem, UniqueFields};
 use librespot::playback::{
@@ -61,12 +62,16 @@ pub enum Command {
     LoadPlaylists,
     /// Load one playlist's tracks through the Web API (by playlist ID).
     LoadPlaylistTracks(String),
-    /// Load the user's Liked Songs through the Web API.
-    LoadLikedTracks,
+    /// Load one page of the user's Liked Songs through the Web API.
+    LoadLikedPage {
+        offset: u32,
+    },
     /// Load recent listening and short-term favorites through the Web API.
     LoadStats,
     /// Search tracks through the Web API.
     Search(String),
+    /// Save settings. Bitrate and normalisation apply at the next start.
+    SaveSettings(Settings),
     /// Stop playing, log out and end `run_engine`.
     Quit,
 }
@@ -101,8 +106,8 @@ pub enum Event {
         playlist_id: String,
         tracks: Vec<TrackSummary>,
     },
-    /// Answer to `Command::LoadLikedTracks`.
-    LikedTracksLoaded(Vec<TrackSummary>),
+    /// Answer to `Command::LoadLikedPage`.
+    LikedPageLoaded(LikedPage),
     /// Answer to `Command::LoadStats`.
     StatsLoaded(Stats),
     /// Answer to `Command::Search`.
@@ -110,6 +115,8 @@ pub enum Event {
         query: String,
         tracks: Vec<TrackSummary>,
     },
+    /// Settings were saved successfully.
+    SettingsSaved,
     Error(String),
 }
 
@@ -132,6 +139,7 @@ pub struct EngineConfig {
     /// `None`: the default audio output (speakers). `Some(path)`: librespot's "pipe" backend writes raw PCM
     /// to this file instead, so nothing is heard.
     pub to_file: Option<PathBuf>,
+    pub settings: Settings,
 }
 
 /// Run the engine until it gets [`Command::Quit`], the command channel closes, or login fails.
@@ -200,6 +208,12 @@ pub async fn run_engine(
             return;
         }
     };
+    let volume = crate::cli::percent_to_volume(config.settings.volume_percent);
+    mixer.set_volume(volume);
+    if evt_tx.send(Event::VolumeChanged(volume)).is_err() {
+        session.shutdown();
+        return;
+    }
     let (backend_name, device) = match config.to_file {
         Some(path) => (Some("pipe".to_string()), Some(path.display().to_string())),
         None => (None, None),
@@ -217,7 +231,11 @@ pub async fn run_engine(
         return;
     };
     let player = Player::new(
-        PlayerConfig::default(),
+        PlayerConfig {
+            bitrate: settings::bitrate(&config.settings),
+            normalisation: config.settings.normalisation,
+            ..PlayerConfig::default()
+        },
         session.clone(),
         mixer.get_soft_volume(),
         move || backend(device, AudioFormat::default()),
@@ -327,9 +345,13 @@ fn handle_command(
             });
             Ok(())
         }
-        Command::LoadLikedTracks => {
-            spawn_web_call(web_api, evt_tx, |api| {
-                Box::pin(async move { api.liked_tracks().await.map(Event::LikedTracksLoaded) })
+        Command::LoadLikedPage { offset } => {
+            spawn_web_call(web_api, evt_tx, move |api| {
+                Box::pin(async move {
+                    api.liked_tracks_page(offset)
+                        .await
+                        .map(Event::LikedPageLoaded)
+                })
             });
             Ok(())
         }
@@ -348,6 +370,10 @@ fn handle_command(
             });
             Ok(())
         }
+        Command::SaveSettings(settings) => match settings::save(&settings) {
+            Ok(()) => evt_tx.send(Event::SettingsSaved),
+            Err(error) => evt_tx.send(Event::Error(format!("{error:#}"))),
+        },
         Command::Quit => return Flow::Quit,
     };
     match sent {

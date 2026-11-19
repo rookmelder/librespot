@@ -15,10 +15,96 @@ use tokio::sync::mpsc::{
 
 use crate::cli::{percent_to_volume, volume_to_percent};
 use crate::engine::{self, Command, EngineConfig, Event, EventSender, TrackInfo};
+use crate::settings::Settings;
 use crate::webapi::{PlaylistSummary, Stats, TrackSummary};
 
+const GREEN: egui::Color32 = egui::Color32::from_rgb(29, 185, 84);
+const BACKGROUND: egui::Color32 = egui::Color32::from_rgb(18, 18, 18);
+const CARD: egui::Color32 = egui::Color32::from_rgb(31, 31, 31);
+const HOVER: egui::Color32 = egui::Color32::from_rgb(42, 42, 42);
+
+fn load_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
+        fonts
+            .font_data
+            .insert("Segoe UI".into(), egui::FontData::from_owned(bytes).into());
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "Segoe UI".into());
+    }
+    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf") {
+        fonts.font_data.insert(
+            "Segoe Emoji".into(),
+            egui::FontData::from_owned(bytes).into(),
+        );
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push("Segoe Emoji".into());
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+fn apply_theme(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.visuals = egui::Visuals::dark();
+    style.visuals.panel_fill = BACKGROUND;
+    style.visuals.window_fill = BACKGROUND;
+    style.visuals.override_text_color = Some(egui::Color32::WHITE);
+    style.visuals.weak_text_color = Some(egui::Color32::from_rgb(179, 179, 179));
+    style.visuals.selection.bg_fill = GREEN;
+    style.visuals.selection.stroke.color = egui::Color32::BLACK;
+    style.visuals.window_corner_radius = egui::CornerRadius::same(6);
+    style.visuals.widgets.inactive.bg_fill = CARD;
+    style.visuals.widgets.inactive.weak_bg_fill = CARD;
+    style.visuals.widgets.hovered.bg_fill = HOVER;
+    style.visuals.widgets.hovered.weak_bg_fill = HOVER;
+    style.visuals.widgets.active.bg_fill = GREEN;
+    style.visuals.widgets.active.weak_bg_fill = GREEN;
+    for widget in [
+        &mut style.visuals.widgets.noninteractive,
+        &mut style.visuals.widgets.inactive,
+        &mut style.visuals.widgets.hovered,
+        &mut style.visuals.widgets.active,
+        &mut style.visuals.widgets.open,
+    ] {
+        widget.corner_radius = egui::CornerRadius::same(6);
+        widget.fg_stroke.color = egui::Color32::WHITE;
+    }
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    for (text_style, size) in [
+        (egui::TextStyle::Heading, 22.0),
+        (egui::TextStyle::Body, 14.0),
+        (egui::TextStyle::Button, 14.0),
+        (egui::TextStyle::Small, 12.0),
+    ] {
+        style
+            .text_styles
+            .insert(text_style, egui::FontId::proportional(size));
+    }
+    ctx.set_style(style);
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum MediaAction {
+    Play,
+    Pause,
+    Stop,
+    Toggle,
+    Next,
+    Previous,
+}
+
 /// Open the window and run until it is closed; then stop the engine and wait for it.
-pub fn run(to_file: Option<PathBuf>) -> Result<()> {
+pub fn run(to_file: Option<PathBuf>, settings: crate::settings::Settings) -> Result<()> {
     let (cmd_tx, cmd_rx) = unbounded_channel::<Command>();
     let (evt_tx, evt_rx) = unbounded_channel::<Event>();
 
@@ -35,12 +121,13 @@ pub fn run(to_file: Option<PathBuf>) -> Result<()> {
         }
     };
 
+    let ui_settings = settings.clone();
     let runtime = tokio::runtime::Runtime::new().context("could not start the Tokio runtime")?;
     let engine_thread = std::thread::Builder::new()
         .name("engine".into())
         .spawn(move || {
             runtime.block_on(engine::run_engine(
-                EngineConfig { to_file },
+                EngineConfig { to_file, settings },
                 cmd_rx,
                 EventSender::new(evt_tx, notify),
             ));
@@ -53,7 +140,7 @@ pub fn run(to_file: Option<PathBuf>) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("rusty-player")
-            .with_inner_size([1000.0, 560.0]),
+            .with_inner_size([1280.0, 800.0]),
         ..Default::default()
     };
     let window_result = eframe::run_native(
@@ -63,7 +150,10 @@ pub fn run(to_file: Option<PathBuf>) -> Result<()> {
             let _ = ctx_slot.set(cc.egui_ctx.clone());
             // Lets `ui.image(url)` download and show the album cover (http + jpeg/png).
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::new(PlayerApp::new(cmd_tx, evt_rx)))
+            load_fonts(&cc.egui_ctx);
+            apply_theme(&cc.egui_ctx);
+            let app = PlayerApp::new(cmd_tx, evt_rx, ui_settings);
+            Ok(Box::new(app))
         }),
     );
 
@@ -102,7 +192,8 @@ pub fn format_time(ms: u32) -> String {
     format!("{minutes}:{seconds:02}")
 }
 
-pub fn track_row_label(n: usize, t: &TrackSummary) -> String {
+#[cfg(test)]
+fn track_row_label(n: usize, t: &TrackSummary) -> String {
     format!(
         "{n}. {} — {}   {}",
         t.name,
@@ -111,13 +202,21 @@ pub fn track_row_label(n: usize, t: &TrackSummary) -> String {
     )
 }
 
-pub fn playlist_label(p: &PlaylistSummary) -> String {
+#[cfg(test)]
+fn playlist_label(p: &PlaylistSummary) -> String {
     format!("{} ({})", p.name, p.track_count)
 }
 
 pub fn next_in_queue(queue: &[String], pos: Option<usize>) -> Option<usize> {
     match pos {
         Some(i) if i + 1 < queue.len() => Some(i + 1),
+        _ => None,
+    }
+}
+
+pub fn prev_in_queue(queue: &[String], pos: Option<usize>) -> Option<usize> {
+    match pos {
+        Some(i) if i > 0 && i < queue.len() => Some(i - 1),
         _ => None,
     }
 }
@@ -130,6 +229,14 @@ enum Status {
     Paused,
     Stopped,
     Ended,
+}
+
+fn toggle_command(status: &Status) -> Option<Command> {
+    match status {
+        Status::Playing(_) => Some(Command::Pause),
+        Status::Paused => Some(Command::Resume),
+        _ => None,
+    }
 }
 
 fn status_text(status: &Status) -> String {
@@ -168,6 +275,18 @@ pub struct PlayerApp {
     tracks_for: Option<String>,
     liked: Vec<TrackSummary>,
     liked_loading: bool,
+    liked_paging_failed: bool,
+    liked_total: Option<u32>,
+    settings: Settings,
+    settings_open: bool,
+    settings_saved: bool,
+    current_uri: Option<String>,
+    #[cfg(windows)]
+    media_controls: Option<souvlaki::MediaControls>,
+    #[cfg(windows)]
+    media_rx: Option<std::sync::mpsc::Receiver<MediaAction>>,
+    #[cfg(windows)]
+    media_init_tried: bool,
     stats: Option<Stats>,
     stats_loading: bool,
     search_input: String,
@@ -180,12 +299,16 @@ pub struct PlayerApp {
 }
 
 impl PlayerApp {
-    pub fn new(cmd_tx: UnboundedSender<Command>, evt_rx: UnboundedReceiver<Event>) -> Self {
+    pub fn new(
+        cmd_tx: UnboundedSender<Command>,
+        evt_rx: UnboundedReceiver<Event>,
+        settings: Settings,
+    ) -> Self {
         Self {
             cmd_tx,
             evt_rx,
             track_input: String::new(),
-            volume_percent: 100,
+            volume_percent: settings.volume_percent.min(100),
             status: Status::LoggingIn,
             username: None,
             last_error: None,
@@ -199,6 +322,18 @@ impl PlayerApp {
             tracks_for: None,
             liked: Vec::new(),
             liked_loading: false,
+            liked_paging_failed: false,
+            liked_total: None,
+            settings,
+            settings_open: false,
+            settings_saved: false,
+            current_uri: None,
+            #[cfg(windows)]
+            media_controls: None,
+            #[cfg(windows)]
+            media_rx: None,
+            #[cfg(windows)]
+            media_init_tried: false,
             stats: None,
             stats_loading: false,
             search_input: String::new(),
@@ -212,6 +347,8 @@ impl PlayerApp {
     }
 
     fn apply_event(&mut self, event: Event, now: Instant) {
+        #[cfg(windows)]
+        self.update_media(&event);
         match event {
             Event::LoggedIn { username } => {
                 self.username = Some(username);
@@ -221,6 +358,7 @@ impl PlayerApp {
                 track_id,
                 position_ms,
             } => {
+                self.current_uri = Some(track_id.clone());
                 self.status = Status::Playing(track_id);
                 self.last_error = None;
                 self.progress = Some(Progress {
@@ -279,10 +417,17 @@ impl PlayerApp {
                     self.tracks_loading = false;
                 }
             }
-            Event::LikedTracksLoaded(tracks) => {
-                self.liked = tracks;
+            Event::LikedPageLoaded(page) => {
+                self.liked_total = Some(page.total);
+                if page.offset as usize == self.liked.len() {
+                    if page.tracks.is_empty() {
+                        self.liked_total = Some(self.liked.len() as u32);
+                    }
+                    self.liked.extend(page.tracks);
+                }
                 self.liked_loading = false;
             }
+            Event::SettingsSaved => self.settings_saved = true,
             Event::StatsLoaded(stats) => {
                 self.stats = Some(stats);
                 self.stats_loading = false;
@@ -294,6 +439,9 @@ impl PlayerApp {
                 }
             }
             Event::Error(msg) => {
+                if self.liked_loading {
+                    self.liked_paging_failed = true;
+                }
                 self.playlists_loading = false;
                 self.tracks_loading = false;
                 self.liked_loading = false;
@@ -320,41 +468,445 @@ impl PlayerApp {
         }
     }
 
-    fn play_from_list(&mut self, tracks: &[TrackSummary], index: usize) {
-        self.queue = tracks.iter().map(|t| t.uri.clone()).collect();
+    fn play_queue(&mut self, queue: Vec<String>, index: usize) {
+        self.queue = queue;
         self.queue_pos = Some(index);
         if let Some(uri) = self.queue.get(index).cloned() {
             self.send(Command::Play(uri));
         }
     }
+
+    fn next(&mut self) {
+        if let Some(index) = next_in_queue(&self.queue, self.queue_pos) {
+            self.queue_pos = Some(index);
+            self.send(Command::Play(self.queue[index].clone()));
+        }
+    }
+
+    fn can_restart(&self, now: Instant) -> bool {
+        self.current_uri.is_some() && self.progress.is_some_and(|p| p.at(now) > 3000)
+    }
+
+    fn previous(&mut self, now: Instant) {
+        if self.can_restart(now) {
+            if let Some(uri) = self.current_uri.clone() {
+                self.send(Command::Play(uri));
+            }
+        } else if let Some(index) = prev_in_queue(&self.queue, self.queue_pos) {
+            self.queue_pos = Some(index);
+            self.send(Command::Play(self.queue[index].clone()));
+        }
+    }
+
+    fn toggle(&mut self) {
+        if let Some(command) = toggle_command(&self.status) {
+            self.send(command);
+        }
+    }
+
+    fn load_liked(&mut self) {
+        self.liked_loading = true;
+        self.send(Command::LoadLikedPage {
+            offset: self.liked.len() as u32,
+        });
+    }
+
+    fn reload_liked(&mut self) {
+        self.liked.clear();
+        self.liked_total = None;
+        self.liked_paging_failed = false;
+        self.load_liked();
+    }
+
+    fn should_load_more_liked(&self, visible_end: usize) -> bool {
+        self.username.is_some()
+            && !self.liked_loading
+            && !self.liked_paging_failed
+            && self
+                .liked_total
+                .is_some_and(|total| self.liked.len() < total as usize)
+            && visible_end.saturating_add(10) >= self.liked.len()
+    }
+
+    fn library_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("playlists")
+            .resizable(true)
+            .default_width(240.0)
+            .frame(side_frame())
+            .show(ctx, |ui| {
+                ui.heading("Your Library");
+                ui.weak(self.username.as_deref().unwrap_or("Logging in..."));
+                let button_text = if self.playlists.is_empty() {
+                    "Load playlists"
+                } else {
+                    "Reload"
+                };
+                if ui
+                    .add_enabled(
+                        !self.playlists_loading && self.username.is_some(),
+                        egui::Button::new(egui::RichText::new(button_text).small()),
+                    )
+                    .clicked()
+                {
+                    self.playlists_loading = true;
+                    self.send(Command::LoadPlaylists);
+                }
+                if self.playlists_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("Loading... (a browser may open the first time)");
+                    });
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_enabled_ui(self.username.is_some(), |ui| {
+                        if library_entry(
+                            ui,
+                            "♥ Liked Songs",
+                            "Your saved songs",
+                            self.view == View::Liked,
+                        )
+                        .clicked()
+                        {
+                            self.view = View::Liked;
+                            if self.liked.is_empty()
+                                && !self.liked_loading
+                                && !self.liked_paging_failed
+                                && self.liked_total != Some(0)
+                            {
+                                self.load_liked();
+                            }
+                        }
+                    });
+                    let mut clicked_playlist = None;
+                    for playlist in &self.playlists {
+                        let selected = self.view == View::Playlist
+                            && self.selected_playlist.as_deref() == Some(&playlist.id);
+                        let response = ui
+                            .add_enabled_ui(self.username.is_some(), |ui| {
+                                library_entry(
+                                    ui,
+                                    &playlist.name,
+                                    &format!("Playlist · {} songs", playlist.track_count),
+                                    selected,
+                                )
+                            })
+                            .inner;
+                        if response.clicked() {
+                            clicked_playlist = Some(playlist.id.clone());
+                        }
+                    }
+                    if let Some(id) = clicked_playlist {
+                        self.view = View::Playlist;
+                        let same_selected = self.selected_playlist.as_deref() == Some(&id);
+                        let is_different = !same_selected
+                            || (self.tracks_for.as_deref() != Some(&id) && !self.tracks_loading);
+                        self.selected_playlist = Some(id.clone());
+                        if is_different {
+                            self.tracks_loading = true;
+                            self.tracks.clear();
+                            self.tracks_for = None;
+                            self.send(Command::LoadPlaylistTracks(id));
+                        }
+                    }
+                    if self.playlists.is_empty() && !self.playlists_loading {
+                        ui.weak("No playlists loaded");
+                    }
+                });
+            });
+    }
+
+    fn play_input(&mut self) {
+        let text = self.track_input.trim().to_string();
+        if !text.is_empty() {
+            self.queue.clear();
+            self.queue_pos = None;
+            self.send(Command::Play(text));
+        }
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.settings_open;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Audio bitrate");
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    for bitrate in [96, 160, 320] {
+                        changed |= ui
+                            .radio_value(
+                                &mut self.settings.bitrate,
+                                bitrate,
+                                format!("{bitrate} kbps"),
+                            )
+                            .changed();
+                    }
+                });
+                changed |= ui
+                    .checkbox(&mut self.settings.normalisation, "Volume normalisation")
+                    .changed();
+                ui.weak("Applies at next start");
+                if changed {
+                    self.settings_saved = false;
+                }
+                ui.add_enabled_ui(self.username.is_some(), |ui| {
+                    ui.horizontal(|ui| {
+                        if primary_button(ui, "Save").clicked() {
+                            self.settings.volume_percent = self.volume_percent;
+                            self.settings_saved = false;
+                            self.send(Command::SaveSettings(self.settings.clone()));
+                        }
+                        if self.settings_saved {
+                            ui.label("Saved");
+                        }
+                    });
+                    ui.separator();
+                    ui.label("Play by link");
+                    ui.horizontal(|ui| {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.track_input)
+                                .hint_text("Track ID or Spotify link")
+                                .desired_width(280.0),
+                        );
+                        let enter =
+                            response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if primary_button(ui, "Play").clicked() || enter {
+                            self.play_input();
+                        }
+                    });
+                });
+            });
+        self.settings_open = open;
+    }
+
+    #[cfg(windows)]
+    fn init_media(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        self.media_init_tried = true;
+        // Escape hatch: RUSTY_PLAYER_NO_MEDIA_KEYS=1 starts without media keys.
+        if std::env::var_os("RUSTY_PLAYER_NO_MEDIA_KEYS").is_some() {
+            return;
+        }
+        let hwnd = match frame.window_handle() {
+            Ok(handle) => match handle.as_raw() {
+                RawWindowHandle::Win32(handle) => handle.hwnd.get() as *mut std::ffi::c_void,
+                _ => return,
+            },
+            Err(error) => {
+                log::warn!("could not get window handle for media controls: {error}");
+                return;
+            }
+        };
+        let mut controls = match souvlaki::MediaControls::new(souvlaki::PlatformConfig {
+            display_name: "rusty-player",
+            dbus_name: "rusty_player",
+            hwnd: Some(hwnd),
+        }) {
+            Ok(controls) => controls,
+            Err(error) => {
+                log::warn!("could not create media controls: {error}");
+                return;
+            }
+        };
+        let (media_tx, media_rx) = std::sync::mpsc::channel();
+        let repaint = ctx.clone();
+        if let Err(error) = controls.attach(move |event| {
+            let action = match event {
+                souvlaki::MediaControlEvent::Play => Some(MediaAction::Play),
+                souvlaki::MediaControlEvent::Pause => Some(MediaAction::Pause),
+                souvlaki::MediaControlEvent::Stop => Some(MediaAction::Stop),
+                souvlaki::MediaControlEvent::Toggle => Some(MediaAction::Toggle),
+                souvlaki::MediaControlEvent::Next => Some(MediaAction::Next),
+                souvlaki::MediaControlEvent::Previous => Some(MediaAction::Previous),
+                _ => None,
+            };
+            if let Some(action) = action {
+                if media_tx.send(action).is_err() {
+                    log::warn!("could not send media action: the window has closed");
+                }
+                repaint.request_repaint();
+            }
+        }) {
+            log::warn!("could not attach media controls: {error}");
+            return;
+        }
+        self.media_controls = Some(controls);
+        self.media_rx = Some(media_rx);
+    }
+
+    #[cfg(windows)]
+    fn update_media(&mut self, event: &Event) {
+        let Some(controls) = self.media_controls.as_mut() else {
+            return;
+        };
+        let result = match event {
+            Event::TrackInfo(info) => controls.set_metadata(souvlaki::MediaMetadata {
+                title: Some(&info.title),
+                artist: Some(&info.artists),
+                album: Some(&info.album),
+                cover_url: info.cover_url.as_deref(),
+                duration: Some(std::time::Duration::from_millis(u64::from(
+                    info.duration_ms,
+                ))),
+            }),
+            Event::Playing { position_ms, .. } => {
+                controls.set_playback(souvlaki::MediaPlayback::Playing {
+                    progress: Some(souvlaki::MediaPosition(std::time::Duration::from_millis(
+                        u64::from(*position_ms),
+                    ))),
+                })
+            }
+            Event::Paused { position_ms } => {
+                controls.set_playback(souvlaki::MediaPlayback::Paused {
+                    progress: Some(souvlaki::MediaPosition(std::time::Duration::from_millis(
+                        u64::from(*position_ms),
+                    ))),
+                })
+            }
+            Event::Stopped | Event::EndOfTrack => {
+                controls.set_playback(souvlaki::MediaPlayback::Stopped)
+            }
+            _ => return,
+        };
+        if let Err(error) = result {
+            log::warn!("could not update media controls: {error}");
+            self.media_controls = None;
+            self.media_rx = None;
+        }
+    }
+}
+
+fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(egui::Button::new(egui::RichText::new(text).color(egui::Color32::BLACK)).fill(GREEN))
+}
+
+fn side_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(egui::Color32::BLACK)
+        .inner_margin(8)
+}
+
+fn library_entry(ui: &mut egui::Ui, title: &str, subtitle: &str, selected: bool) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 54.0), egui::Sense::click());
+    ui.painter().rect_filled(
+        rect,
+        6.0,
+        if selected || response.hovered() {
+            HOVER
+        } else {
+            egui::Color32::BLACK
+        },
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink(8.0))
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    child.add(egui::Label::new(egui::RichText::new(title).strong()).truncate());
+    child.add(egui::Label::new(egui::RichText::new(subtitle).weak().small()).truncate());
+    response
+}
+
+fn queue_uris(tracks: &[TrackSummary]) -> Vec<String> {
+    tracks.iter().map(|track| track.uri.clone()).collect()
 }
 
 fn track_list(
     ui: &mut egui::Ui,
     tracks: &[TrackSummary],
     playing_uri: Option<&str>,
-) -> Option<usize> {
-    let row_height = ui.spacing().interact_size.y;
+    loading: bool,
+    paging_failed: bool,
+) -> (Option<usize>, usize, bool) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [32.0, 22.0],
+            egui::Label::new(egui::RichText::new("#").weak()),
+        );
+        ui.weak("Title");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.weak("Duration");
+        });
+    });
+    ui.separator();
+    let row_height = 54.0;
     let mut clicked_idx = None;
+    let mut visible_end = 0;
+    let mut retry = false;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .show_rows(ui, row_height, tracks.len(), |ui, rows| {
-            let first = rows.start;
-            for (offset, track) in tracks[rows].iter().enumerate() {
-                let idx = first + offset;
-                let is_current = playing_uri == Some(track.uri.as_str());
-                let text = track_row_label(idx + 1, track);
-                let response = ui.selectable_label(is_current, text);
-                if response.double_clicked() {
-                    clicked_idx = Some(idx);
+        .show_rows(
+            ui,
+            row_height,
+            tracks.len() + usize::from(loading || paging_failed),
+            |ui, rows| {
+                visible_end = rows.end.min(tracks.len());
+                for idx in rows {
+                    let Some(track) = tracks.get(idx) else {
+                        if paging_failed {
+                            ui.horizontal(|ui| {
+                                ui.weak("Couldn't load more ·");
+                                retry = ui.small_button("Retry").clicked();
+                            });
+                        } else {
+                            ui.add_sized([ui.available_width(), row_height], egui::Spinner::new());
+                        }
+                        continue;
+                    };
+                    let is_current = playing_uri == Some(track.uri.as_str());
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), row_height),
+                        egui::Sense::click(),
+                    );
+                    if response.hovered() {
+                        ui.painter().rect_filled(rect, 6.0, HOVER);
+                    }
+                    let mut row = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(rect.shrink2(egui::vec2(6.0, 4.0)))
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    row.add_sized(
+                        [26.0, 30.0],
+                        egui::Label::new(egui::RichText::new((idx + 1).to_string()).weak()),
+                    );
+                    let title_width = (row.available_width() - 80.0).max(0.0);
+                    row.allocate_ui_with_layout(
+                        egui::vec2(title_width, 44.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            let mut title = egui::RichText::new(&track.name).strong();
+                            if is_current {
+                                title = title.color(GREEN);
+                            }
+                            ui.add(egui::Label::new(title).truncate());
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&track.artists).weak())
+                                    .truncate(),
+                            );
+                        },
+                    );
+                    row.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.weak(format_time(track.duration_ms));
+                    });
+                    if response.double_clicked() {
+                        clicked_idx = Some(idx);
+                    }
                 }
-            }
-        });
-    clicked_idx
+            },
+        );
+    (clicked_idx, visible_end, retry)
 }
 
 impl eframe::App for PlayerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        if !self.media_init_tried {
+            self.init_media(ctx, _frame);
+        }
         let now = Instant::now();
         loop {
             match self.evt_rx.try_recv() {
@@ -369,203 +921,220 @@ impl eframe::App for PlayerApp {
             }
         }
 
-        egui::TopBottomPanel::top("search").show(ctx, |ui| {
-            ui.add_enabled_ui(self.username.is_some(), |ui| {
-                ui.horizontal(|ui| {
-                    let text_edit = egui::TextEdit::singleline(&mut self.search_input)
-                        .hint_text("Search songs")
-                        .desired_width(300.0);
-                    let response = ui.add(text_edit);
+        #[cfg(windows)]
+        loop {
+            let action = self.media_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+            let Some(action) = action else { break };
+            if self.username.is_none() || self.cmd_tx.is_closed() {
+                continue;
+            }
+            match action {
+                MediaAction::Play => self.send(Command::Resume),
+                MediaAction::Pause => self.send(Command::Pause),
+                MediaAction::Stop => self.send(Command::Stop),
+                MediaAction::Toggle => self.toggle(),
+                MediaAction::Next => self.next(),
+                MediaAction::Previous => self.previous(now),
+            }
+        }
 
-                    let enter_pressed =
-                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let search_clicked = ui.button("Search").clicked();
-
-                    if enter_pressed || search_clicked {
-                        let trimmed = self.search_input.trim();
-                        if !trimmed.is_empty() {
-                            self.search_query = Some(trimmed.to_string());
-                            self.search_loading = true;
-                            self.view = View::Search;
-                            self.search_results.clear();
-                            self.send(Command::Search(trimmed.to_string()));
-                        }
-                    }
-                });
-            });
-        });
-
-        egui::SidePanel::left("playlists")
-            .resizable(true)
-            .default_width(200.0)
+        egui::TopBottomPanel::top("search")
+            .frame(side_frame())
             .show(ctx, |ui| {
-                match &self.username {
-                    Some(name) => {
-                        ui.label(format!("Logged in as {name}"));
-                    }
-                    None => {
-                        ui.label("Logging in...");
-                    }
-                }
+                ui.horizontal(|ui| {
+                    ui.add_space((ui.available_width() * 0.28).max(0.0));
+                    ui.add_enabled_ui(self.username.is_some(), |ui| {
+                        ui.horizontal(|ui| {
+                            let text_edit = egui::TextEdit::singleline(&mut self.search_input)
+                                .hint_text("What do you want to play?")
+                                .desired_width(340.0);
+                            let response = ui.add(text_edit);
 
-                let liked_selected = self.view == View::Liked;
-                if ui
-                    .selectable_label(liked_selected, "♥ Liked Songs")
-                    .clicked()
-                {
-                    self.view = View::Liked;
-                    if self.liked.is_empty() && !self.liked_loading {
-                        self.liked_loading = true;
-                        self.send(Command::LoadLikedTracks);
-                    }
-                }
+                            let enter_pressed = response.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            let search_clicked = primary_button(ui, "Search").clicked();
 
-                ui.heading("Playlists");
-
-                let button_text = if self.playlists.is_empty() {
-                    "Load playlists"
-                } else {
-                    "Reload"
-                };
-                let can_load = !self.playlists_loading && self.username.is_some();
-                if ui
-                    .add_enabled(can_load, egui::Button::new(button_text))
-                    .clicked()
-                {
-                    self.playlists_loading = true;
-                    self.send(Command::LoadPlaylists);
-                }
-
-                if self.playlists_loading {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Loading... (a browser may open the first time)");
+                            if enter_pressed || search_clicked {
+                                let trimmed = self.search_input.trim();
+                                if !trimmed.is_empty() {
+                                    self.search_query = Some(trimmed.to_string());
+                                    self.search_loading = true;
+                                    self.view = View::Search;
+                                    self.search_results.clear();
+                                    self.send(Command::Search(trimmed.to_string()));
+                                }
+                            }
+                        });
                     });
-                }
-
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let mut clicked_playlist = None;
-                    for playlist in &self.playlists {
-                        let selected = self.selected_playlist.as_deref() == Some(&playlist.id);
-                        if ui
-                            .selectable_label(selected, playlist_label(playlist))
-                            .clicked()
-                        {
-                            clicked_playlist = Some(playlist.id.clone());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("⚙").on_hover_text("Settings").clicked() {
+                            self.settings_open = true;
                         }
-                    }
-
-                    if let Some(id) = clicked_playlist {
-                        self.view = View::Playlist;
-                        let same_selected = self.selected_playlist.as_deref() == Some(&id);
-                        // Load unless these tracks are shown already or are loading right now.
-                        let is_different = !same_selected
-                            || (self.tracks_for.as_deref() != Some(&id) && !self.tracks_loading);
-                        self.selected_playlist = Some(id.clone());
-                        if is_different {
-                            self.tracks_loading = true;
-                            self.tracks.clear();
-                            self.tracks_for = None;
-                            self.send(Command::LoadPlaylistTracks(id));
-                        }
-                    }
-
-                    if self.playlists.is_empty() && !self.playlists_loading {
-                        ui.label(egui::RichText::new("No playlists loaded").weak());
-                    }
+                    });
                 });
             });
 
-        egui::TopBottomPanel::bottom("player").show(ctx, |ui| {
-            if let Some(track) = &self.track {
+        egui::TopBottomPanel::bottom("player")
+            .exact_height(90.0)
+            .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(12))
+            .show(ctx, |ui| {
+                let width = ui.available_width();
+                let left_width = width * 0.28;
+                let center_width = width * 0.44;
                 ui.horizontal(|ui| {
-                    if let Some(ref url) = track.cover_url {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(left_width, 64.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            if let Some(track) = &self.track {
+                                if let Some(url) = &track.cover_url {
+                                    ui.add(
+                                        egui::Image::new(url.as_str())
+                                            .fit_to_exact_size(egui::vec2(56.0, 56.0))
+                                            .corner_radius(6.0),
+                                    );
+                                } else {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(56.0, 56.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(rect, 6.0, CARD);
+                                }
+                                ui.vertical(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&track.title).strong(),
+                                        )
+                                        .truncate(),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&track.artists).weak(),
+                                        )
+                                        .truncate(),
+                                    );
+                                });
+                            } else {
+                                ui.weak(status_text(&self.status));
+                            }
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(center_width, 64.0),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            ui.add_enabled_ui(self.username.is_some(), |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(((center_width - 156.0) / 2.0).max(0.0));
+                                    let previous = self.can_restart(now)
+                                        || prev_in_queue(&self.queue, self.queue_pos).is_some();
+                                    if ui
+                                        .add_enabled(previous, egui::Button::new("⏮"))
+                                        .on_hover_text("Previous")
+                                        .clicked()
+                                    {
+                                        self.previous(now);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            toggle_command(&self.status).is_some(),
+                                            egui::Button::new(
+                                                egui::RichText::new("⏯")
+                                                    .color(egui::Color32::BLACK),
+                                            )
+                                            .fill(GREEN),
+                                        )
+                                        .on_hover_text(
+                                            if matches!(self.status, Status::Playing(_)) {
+                                                "Pause"
+                                            } else {
+                                                "Resume"
+                                            },
+                                        )
+                                        .clicked()
+                                    {
+                                        self.toggle();
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            next_in_queue(&self.queue, self.queue_pos).is_some(),
+                                            egui::Button::new("⏭"),
+                                        )
+                                        .on_hover_text("Next")
+                                        .clicked()
+                                    {
+                                        self.next();
+                                    }
+                                });
+                            });
+                            let duration = self.track.as_ref().map_or(0, |t| t.duration_ms);
+                            let position = self.progress.map_or(0, |p| p.at(now)).min(duration);
+                            let fraction = if duration == 0 {
+                                0.0
+                            } else {
+                                position as f32 / duration as f32
+                            };
+                            ui.horizontal(|ui| {
+                                ui.weak(format_time(position));
+                                ui.add(
+                                    egui::ProgressBar::new(fraction)
+                                        .fill(GREEN)
+                                        .desired_height(5.0)
+                                        .desired_width((center_width - 105.0).max(30.0)),
+                                );
+                                ui.weak(format_time(duration));
+                            });
+                        },
+                    );
+                    ui.add_enabled_ui(self.username.is_some(), |ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().slider_width = 120.0;
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut self.volume_percent, 0..=100)
+                                        .show_value(false)
+                                        .trailing_fill(true),
+                                )
+                                .on_hover_text(format!("{}%", self.volume_percent))
+                                .changed()
+                            {
+                                self.settings_saved = false;
+                                self.send(Command::SetVolume(percent_to_volume(
+                                    self.volume_percent,
+                                )));
+                            }
+                            ui.label("🔊");
+                        });
+                    });
+                });
+            });
+
+        if let Some(message) = self.last_error.clone() {
+            egui::TopBottomPanel::bottom("error")
+                .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(6))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
                         ui.add(
-                            egui::Image::new(url.as_str())
-                                .fit_to_exact_size(egui::vec2(64.0, 64.0))
-                                .corner_radius(4.0),
+                            egui::Label::new(
+                                egui::RichText::new(message)
+                                    .small()
+                                    .color(egui::Color32::LIGHT_RED),
+                            )
+                            .truncate(),
                         );
-                    } else {
-                        ui.allocate_exact_size(egui::vec2(64.0, 64.0), egui::Sense::hover());
-                    }
-
-                    ui.vertical(|ui| {
-                        ui.heading(&track.title);
-                        ui.label(&track.artists);
-                        ui.label(egui::RichText::new(&track.album).weak());
-                    });
-                });
-
-                if track.duration_ms > 0 {
-                    let position = self
-                        .progress
-                        .map(|p| p.at(now))
-                        .unwrap_or(0)
-                        .min(track.duration_ms);
-                    let fraction = (position as f32 / track.duration_ms as f32).clamp(0.0, 1.0);
-                    ui.horizontal(|ui| {
-                        ui.add(egui::ProgressBar::new(fraction).desired_width(300.0));
-                        ui.label(format!(
-                            "{} / {}",
-                            format_time(position),
-                            format_time(track.duration_ms)
-                        ));
-                    });
-                }
-            }
-
-            ui.add_enabled_ui(self.username.is_some(), |ui| {
-                ui.horizontal(|ui| {
-                    let text_edit = egui::TextEdit::singleline(&mut self.track_input)
-                        .hint_text("Track ID or Spotify link")
-                        .desired_width(260.0);
-                    let response = ui.add(text_edit);
-
-                    let enter_pressed =
-                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let play_clicked = ui.button("Play").clicked();
-
-                    if play_clicked || enter_pressed {
-                        let trimmed = self.track_input.trim();
-                        if !trimmed.is_empty() {
-                            self.queue.clear();
-                            self.queue_pos = None;
-                            self.send(Command::Play(trimmed.to_string()));
+                        if ui.small_button("×").clicked() {
+                            self.last_error = None;
                         }
-                    }
+                    });
                 });
+        }
 
-                ui.horizontal(|ui| {
-                    if ui.button("Pause").clicked() {
-                        self.send(Command::Pause);
-                    }
-                    if ui.button("Resume").clicked() {
-                        self.send(Command::Resume);
-                    }
-                    if ui.button("Stop").clicked() {
-                        self.send(Command::Stop);
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Volume");
-                    let slider = egui::Slider::new(&mut self.volume_percent, 0..=100).suffix("%");
-                    if ui.add(slider).changed() {
-                        self.send(Command::SetVolume(percent_to_volume(self.volume_percent)));
-                    }
-                });
-            });
-
-            ui.label(status_text(&self.status));
-
-            if let Some(msg) = &self.last_error {
-                ui.label(egui::RichText::new(format!("Error: {msg}")).color(egui::Color32::RED));
-            }
-        });
+        self.library_panel(ctx);
 
         egui::SidePanel::right("stats")
             .resizable(true)
             .default_width(220.0)
+            .frame(side_frame())
             .show(ctx, |ui| {
                 ui.heading("Stats");
 
@@ -597,9 +1166,9 @@ impl eframe::App for PlayerApp {
                             for (idx, track) in stats.recently_played.iter().enumerate() {
                                 let label_text = format!("{} — {}", track.name, track.artists);
                                 let response = ui.selectable_label(false, label_text);
-                                if response.double_clicked() {
+                                if response.double_clicked() && self.username.is_some() {
                                     clicked_stats_track =
-                                        Some((stats.recently_played.clone(), idx));
+                                        Some((queue_uris(&stats.recently_played), idx));
                                 }
                             }
                         });
@@ -608,8 +1177,9 @@ impl eframe::App for PlayerApp {
                             for (idx, track) in stats.top_tracks.iter().enumerate() {
                                 let label_text = format!("{} — {}", track.name, track.artists);
                                 let response = ui.selectable_label(false, label_text);
-                                if response.double_clicked() {
-                                    clicked_stats_track = Some((stats.top_tracks.clone(), idx));
+                                if response.double_clicked() && self.username.is_some() {
+                                    clicked_stats_track =
+                                        Some((queue_uris(&stats.top_tracks), idx));
                                 }
                             }
                         });
@@ -623,15 +1193,12 @@ impl eframe::App for PlayerApp {
                 });
 
                 if let Some((list, idx)) = clicked_stats_track {
-                    self.play_from_list(&list, idx);
+                    self.play_queue(list, idx);
                 }
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let playing_uri = match &self.status {
-                Status::Playing(uri) => Some(uri.clone()),
-                _ => None,
-            };
+            let playing_uri = self.current_uri.clone();
             let playing_uri_ref = playing_uri.as_deref();
 
             match self.view {
@@ -641,6 +1208,7 @@ impl eframe::App for PlayerApp {
                         None => "Search".to_string(),
                     };
                     ui.heading(heading_text);
+                    ui.weak(format!("{} songs", self.search_results.len()));
 
                     if self.search_loading {
                         ui.horizontal(|ui| {
@@ -649,34 +1217,58 @@ impl eframe::App for PlayerApp {
                         });
                     } else if self.search_results.is_empty() {
                         ui.label(egui::RichText::new("No results").weak());
-                    } else if let Some(idx) = track_list(ui, &self.search_results, playing_uri_ref)
+                    } else if let (Some(idx), _, _) =
+                        track_list(ui, &self.search_results, playing_uri_ref, false, false)
                     {
-                        self.play_from_list(&self.search_results.clone(), idx);
+                        if self.username.is_some() {
+                            let queue = queue_uris(&self.search_results);
+                            self.play_queue(queue, idx);
+                        }
                     }
                 }
                 View::Liked => {
                     let mut reload_clicked = false;
                     ui.horizontal(|ui| {
                         ui.heading("Liked Songs");
-                        if ui.small_button("Reload").clicked() {
+                        if ui
+                            .add_enabled(
+                                self.username.is_some() && !self.liked_loading,
+                                egui::Button::new("Reload").small(),
+                            )
+                            .clicked()
+                        {
                             reload_clicked = true;
                         }
                     });
 
                     if reload_clicked {
-                        self.liked_loading = true;
-                        self.send(Command::LoadLikedTracks);
+                        self.reload_liked();
                     }
-
-                    if self.liked_loading {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("Loading...");
-                        });
-                    } else if self.liked.is_empty() {
+                    ui.weak(format!(
+                        "{} songs",
+                        self.liked_total.map_or(self.liked.len(), |n| n as usize)
+                    ));
+                    if self.liked.is_empty() && !self.liked_loading {
                         ui.label(egui::RichText::new("No liked tracks").weak());
-                    } else if let Some(idx) = track_list(ui, &self.liked, playing_uri_ref) {
-                        self.play_from_list(&self.liked.clone(), idx);
+                    }
+                    let (clicked, visible_end, retry) = track_list(
+                        ui,
+                        &self.liked,
+                        playing_uri_ref,
+                        self.liked_loading,
+                        self.liked_paging_failed,
+                    );
+                    if self.username.is_some() {
+                        if let Some(idx) = clicked {
+                            let queue = queue_uris(&self.liked);
+                            self.play_queue(queue, idx);
+                        }
+                        if retry && !self.liked_loading {
+                            self.liked_paging_failed = false;
+                            self.load_liked();
+                        } else if self.should_load_more_liked(visible_end) {
+                            self.load_liked();
+                        }
                     }
                 }
                 View::Playlist => {
@@ -687,6 +1279,12 @@ impl eframe::App for PlayerApp {
                         .map(|p| p.name.as_str())
                         .unwrap_or("Select a playlist");
                     ui.heading(heading_text);
+                    let count = self
+                        .selected_playlist
+                        .as_ref()
+                        .and_then(|id| self.playlists.iter().find(|p| &p.id == id))
+                        .map_or(self.tracks.len(), |p| p.track_count as usize);
+                    ui.weak(format!("{count} songs"));
 
                     if self.tracks_loading {
                         ui.horizontal(|ui| {
@@ -696,13 +1294,20 @@ impl eframe::App for PlayerApp {
                     } else if self.selected_playlist.is_some() {
                         if self.tracks.is_empty() {
                             ui.label(egui::RichText::new("No playable tracks").weak());
-                        } else if let Some(idx) = track_list(ui, &self.tracks, playing_uri_ref) {
-                            self.play_from_list(&self.tracks.clone(), idx);
+                        } else if let (Some(idx), _, _) =
+                            track_list(ui, &self.tracks, playing_uri_ref, false, false)
+                        {
+                            if self.username.is_some() {
+                                let queue = queue_uris(&self.tracks);
+                                self.play_queue(queue, idx);
+                            }
                         }
                     }
                 }
             }
         });
+
+        self.settings_window(ctx);
 
         if self.progress.is_some_and(|p| p.running) {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -718,7 +1323,7 @@ mod tests {
     fn create_test_app() -> (UnboundedSender<Event>, PlayerApp) {
         let (cmd_tx, _cmd_rx) = unbounded_channel();
         let (evt_tx, evt_rx) = unbounded_channel();
-        (evt_tx, PlayerApp::new(cmd_tx, evt_rx))
+        (evt_tx, PlayerApp::new(cmd_tx, evt_rx, Settings::default()))
     }
 
     #[test]
@@ -1162,7 +1767,7 @@ mod tests {
     fn test_send_dropped_receiver() {
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (_evt_tx, evt_rx) = unbounded_channel();
-        let mut app = PlayerApp::new(cmd_tx, evt_rx);
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
 
         drop(cmd_rx);
         assert_eq!(app.last_error, None);
@@ -1174,7 +1779,7 @@ mod tests {
     fn test_send_live_receiver() {
         let (cmd_tx, mut cmd_rx) = unbounded_channel();
         let (_evt_tx, evt_rx) = unbounded_channel();
-        let mut app = PlayerApp::new(cmd_tx, evt_rx);
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
 
         app.send(Command::Play("spotify:track:xyz".into()));
         assert_eq!(app.last_error, None);
@@ -1185,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_event_liked_tracks_loaded() {
+    fn test_apply_event_liked_page_loaded() {
         let t0 = Instant::now();
         let (_evt_tx, mut app) = create_test_app();
         app.liked_loading = true;
@@ -1197,9 +1802,283 @@ mod tests {
             duration_ms: 180_000,
         }];
 
-        app.apply_event(Event::LikedTracksLoaded(liked.clone()), t0);
+        app.apply_event(
+            Event::LikedPageLoaded(crate::webapi::LikedPage {
+                offset: 0,
+                tracks: liked.clone(),
+                total: 42,
+            }),
+            t0,
+        );
         assert_eq!(app.liked, liked);
+        assert_eq!(app.liked_total, Some(42));
         assert!(!app.liked_loading);
+    }
+
+    #[test]
+    fn test_liked_page_wrong_offset_ignored() {
+        let (_, mut app) = create_test_app();
+        let track = TrackSummary {
+            uri: "spotify:track:fixture".into(),
+            name: "Fixture".into(),
+            artists: "Artist".into(),
+            duration_ms: 1000,
+        };
+        app.liked = vec![track.clone()];
+        for offset in [0, 2] {
+            app.liked_loading = true;
+            app.apply_event(
+                Event::LikedPageLoaded(crate::webapi::LikedPage {
+                    offset,
+                    tracks: vec![track.clone()],
+                    total: 8,
+                }),
+                Instant::now(),
+            );
+            assert_eq!(app.liked, vec![track.clone()]);
+            assert_eq!(app.liked_total, Some(8));
+            assert!(!app.liked_loading);
+        }
+        app.apply_event(
+            Event::LikedPageLoaded(crate::webapi::LikedPage {
+                offset: 1,
+                tracks: vec![track],
+                total: 8,
+            }),
+            Instant::now(),
+        );
+        assert_eq!(app.liked.len(), 2);
+    }
+
+    #[test]
+    fn test_toggle_command() {
+        assert_eq!(
+            toggle_command(&Status::Playing("fixture".into())),
+            Some(Command::Pause)
+        );
+        assert_eq!(toggle_command(&Status::Paused), Some(Command::Resume));
+        for status in [
+            Status::LoggingIn,
+            Status::Idle,
+            Status::Stopped,
+            Status::Ended,
+        ] {
+            assert_eq!(toggle_command(&status), None);
+        }
+    }
+
+    #[test]
+    fn test_prev_in_queue() {
+        let queue = vec!["first".into(), "second".into(), "third".into()];
+        assert_eq!(prev_in_queue(&queue, Some(2)), Some(1));
+        assert_eq!(prev_in_queue(&queue, Some(1)), Some(0));
+        assert_eq!(prev_in_queue(&queue, Some(0)), None);
+        assert_eq!(prev_in_queue(&queue, None), None);
+        assert_eq!(prev_in_queue(&queue, Some(3)), None);
+        assert_eq!(prev_in_queue(&[], None), None);
+        assert_eq!(prev_in_queue(&[], Some(0)), None);
+        assert_eq!(prev_in_queue(&[], Some(1)), None);
+    }
+
+    #[test]
+    fn test_previous_restarts_after_three_seconds_and_otherwise_moves_back() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = unbounded_channel();
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
+        let now = Instant::now();
+        app.queue = vec!["first".into(), "second".into()];
+        app.queue_pos = Some(1);
+        app.apply_event(
+            Event::Playing {
+                track_id: "second".into(),
+                position_ms: 2800,
+            },
+            now,
+        );
+        app.previous(now + Duration::from_millis(201));
+        assert_eq!(cmd_rx.try_recv(), Ok(Command::Play("second".into())));
+        assert_eq!(app.queue_pos, Some(1));
+        app.previous(now + Duration::from_millis(200));
+        assert_eq!(cmd_rx.try_recv(), Ok(Command::Play("first".into())));
+        assert_eq!(app.queue_pos, Some(0));
+        app.progress = None;
+        app.previous(now);
+        assert_eq!(cmd_rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn test_previous_restarts_a_paused_track_without_a_queue() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = unbounded_channel();
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
+        let now = Instant::now();
+        app.apply_event(
+            Event::Playing {
+                track_id: "fixture".into(),
+                position_ms: 0,
+            },
+            now,
+        );
+        app.apply_event(Event::Paused { position_ms: 3001 }, now);
+        app.previous(now);
+        assert_eq!(cmd_rx.try_recv(), Ok(Command::Play("fixture".into())));
+        assert_eq!(app.queue_pos, None);
+    }
+
+    #[test]
+    fn test_liked_paging_error_stops_automatic_loading() {
+        let (_, mut app) = create_test_app();
+        app.username = Some("testuser".into());
+        app.liked_total = Some(42);
+        assert!(app.should_load_more_liked(0));
+        app.liked_loading = true;
+        assert!(!app.should_load_more_liked(0));
+
+        app.apply_event(Event::Error("page failed".into()), Instant::now());
+
+        assert!(app.liked_paging_failed);
+        assert!(!app.liked_loading);
+        assert!(!app.should_load_more_liked(0));
+    }
+
+    #[test]
+    fn test_error_without_liked_loading_does_not_block_paging() {
+        let (_, mut app) = create_test_app();
+        app.username = Some("testuser".into());
+        app.liked_total = Some(42);
+
+        app.apply_event(Event::Error("unrelated failure".into()), Instant::now());
+
+        assert!(!app.liked_paging_failed);
+        assert!(app.should_load_more_liked(0));
+    }
+
+    #[test]
+    fn test_reload_liked_clears_paging_failure_and_requests_first_page() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_, evt_rx) = unbounded_channel();
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
+        app.liked = vec![TrackSummary {
+            uri: "fixture".into(),
+            name: "Song".into(),
+            artists: "Artist".into(),
+            duration_ms: 1000,
+        }];
+        app.liked_total = Some(42);
+        app.liked_paging_failed = true;
+
+        app.reload_liked();
+
+        assert!(!app.liked_paging_failed);
+        assert!(app.liked.is_empty());
+        assert_eq!(app.liked_total, None);
+        assert!(app.liked_loading);
+        assert_eq!(cmd_rx.try_recv(), Ok(Command::LoadLikedPage { offset: 0 }));
+    }
+
+    #[test]
+    fn test_empty_liked_page_at_current_offset_stops_paging() {
+        let (_, mut app) = create_test_app();
+        app.username = Some("testuser".into());
+        app.liked = vec![TrackSummary {
+            uri: "fixture".into(),
+            name: "Song".into(),
+            artists: "Artist".into(),
+            duration_ms: 1000,
+        }];
+        app.liked_loading = true;
+
+        app.apply_event(
+            Event::LikedPageLoaded(crate::webapi::LikedPage {
+                offset: 1,
+                tracks: Vec::new(),
+                total: 42,
+            }),
+            Instant::now(),
+        );
+
+        assert_eq!(app.liked_total, Some(app.liked.len() as u32));
+        assert!(!app.liked_loading);
+        assert!(!app.should_load_more_liked(app.liked.len()));
+    }
+
+    #[test]
+    fn test_empty_initial_liked_page_stops_paging() {
+        let (_, mut app) = create_test_app();
+        app.username = Some("testuser".into());
+        app.liked_loading = true;
+        app.apply_event(
+            Event::LikedPageLoaded(crate::webapi::LikedPage {
+                offset: 0,
+                tracks: Vec::new(),
+                total: 42,
+            }),
+            Instant::now(),
+        );
+        assert_eq!(app.liked_total, Some(0));
+        assert!(!app.should_load_more_liked(0));
+    }
+
+    #[test]
+    fn test_queue_from_borrowed_tracks_plays_selected_uri() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_, evt_rx) = unbounded_channel();
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
+        app.tracks = vec![TrackSummary {
+            uri: "fixture".into(),
+            name: "Song".into(),
+            artists: "Artist".into(),
+            duration_ms: 1000,
+        }];
+        let queue = queue_uris(&app.tracks);
+        app.play_queue(queue, 0);
+        assert_eq!(app.queue, vec!["fixture".to_string()]);
+        assert_eq!(app.queue_pos, Some(0));
+        assert_eq!(app.tracks.len(), 1);
+        assert_eq!(cmd_rx.try_recv(), Ok(Command::Play("fixture".into())));
+    }
+
+    #[test]
+    fn test_liked_load_uses_loaded_count() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = unbounded_channel();
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
+        app.load_liked();
+        assert!(app.liked_loading);
+        assert_eq!(cmd_rx.try_recv(), Ok(Command::LoadLikedPage { offset: 0 }));
+        app.apply_event(
+            Event::LikedPageLoaded(crate::webapi::LikedPage {
+                offset: 0,
+                tracks: vec![TrackSummary {
+                    uri: "fixture".into(),
+                    name: "Song".into(),
+                    artists: "Artist".into(),
+                    duration_ms: 1000,
+                }],
+                total: 2,
+            }),
+            Instant::now(),
+        );
+        app.load_liked();
+        assert!(app.liked_loading);
+        assert_eq!(cmd_rx.try_recv(), Ok(Command::LoadLikedPage { offset: 1 }));
+    }
+
+    #[test]
+    fn test_loaded_settings_and_saved_event() {
+        let (cmd_tx, _cmd_rx) = unbounded_channel();
+        let (_evt_tx, evt_rx) = unbounded_channel();
+        let settings = Settings {
+            bitrate: 96,
+            normalisation: true,
+            volume_percent: 35,
+        };
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, settings.clone());
+        assert_eq!(app.settings, settings);
+        assert_eq!(app.volume_percent, 35);
+        assert!(!app.settings_saved);
+        app.apply_event(Event::SettingsSaved, Instant::now());
+        assert!(app.settings_saved);
     }
 
     #[test]
@@ -1268,7 +2147,7 @@ mod tests {
         let t0 = Instant::now();
         let (cmd_tx, mut cmd_rx) = unbounded_channel();
         let (_evt_tx, evt_rx) = unbounded_channel();
-        let mut app = PlayerApp::new(cmd_tx, evt_rx);
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
 
         app.queue = vec![
             "spotify:track:1".into(),
@@ -1294,7 +2173,7 @@ mod tests {
         let t0 = Instant::now();
         let (cmd_tx, mut cmd_rx) = unbounded_channel();
         let (_evt_tx, evt_rx) = unbounded_channel();
-        let mut app = PlayerApp::new(cmd_tx, evt_rx);
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
 
         app.queue = vec!["spotify:track:1".into(), "spotify:track:2".into()];
         app.queue_pos = Some(1);
@@ -1312,7 +2191,7 @@ mod tests {
         let t0 = Instant::now();
         let (cmd_tx, mut cmd_rx) = unbounded_channel();
         let (_evt_tx, evt_rx) = unbounded_channel();
-        let mut app = PlayerApp::new(cmd_tx, evt_rx);
+        let mut app = PlayerApp::new(cmd_tx, evt_rx, Settings::default());
 
         app.queue = vec!["spotify:track:1".into(), "spotify:track:2".into()];
         app.queue_pos = Some(0);
